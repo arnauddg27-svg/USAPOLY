@@ -146,7 +146,7 @@ def test_summarize_exchange_open_orders_with_dict_payload():
     assert notional == pytest.approx(0.42 * 11)
 
 
-def test_fast_cycle_no_resting_orders_skips_tracking(monkeypatch):
+def test_fast_cycle_no_resting_orders_skips_tracking_but_records_exposure(monkeypatch):
     bot = PolyEdgeBot()
     bot.cfg.simulation_mode = False
     bot.cfg.trading_enabled = True
@@ -196,7 +196,11 @@ def test_fast_cycle_no_resting_orders_skips_tracking(monkeypatch):
 
     bot.executor.place_order.assert_called_once()
     bot.order_mgr.track.assert_not_called()
-    bot.exposure.record_trade.assert_not_called()
+    bot.exposure.record_trade.assert_called_once()
+    args = bot.exposure.record_trade.call_args.args
+    assert args[0] == "basketball_nba"
+    assert args[1] == market.condition_id
+    assert args[2] > 0
     assert bot.trades_today == 1
 
 

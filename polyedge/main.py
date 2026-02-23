@@ -564,9 +564,11 @@ class PolyEdgeBot:
                     if order:
                         order.event_title = matched.poly_market.event_title
                         order.event_start_ts = event_start_ts
-                        if not self.cfg.no_resting_orders:
+                        if not self.cfg.no_resting_orders and self.order_mgr is not None:
                             self.order_mgr.track(order)
-                            self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
+                        # Exposure limits should apply to any successfully submitted live trade,
+                        # including no-resting (FOK/IOC-like) executions.
+                        self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
                         self.condition_side_lock[cid] = opp.buy_outcome
                         self.trades_today += 1
                         logger.info("ORDER SUBMITTED: %s %s edge=%.1f%% $%.2f @ %.4f",
