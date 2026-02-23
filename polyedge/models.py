@@ -82,6 +82,7 @@ class AllBookOdds:
     away: str
     commence_time: str
     books: dict[str, tuple[SportsOutcome, SportsOutcome]] = field(default_factory=dict)
+    spread_books: dict[str, tuple[SportsOutcome, SportsOutcome]] = field(default_factory=dict)
 
 @dataclass
 class PolyMarket:
@@ -91,6 +92,10 @@ class PolyMarket:
     outcome_b: str
     token_id_a: str
     token_id_b: str
+    market_type: str = "moneyline"
+    sport_tag: str = ""
+    question: str = ""
+    start_iso: str = ""
 
 @dataclass
 class MatchedEvent:
@@ -135,10 +140,14 @@ class OpenOrder:
     order_id: str
     token_id: str
     condition_id: str
+    sport: str
     side: str
     price: float
     size: float
     placed_at: float
     ttl_sec: int
     original_edge: float
+    amount_usd: float = 0.0
     filled_size: float = 0.0
+    event_title: str = ""
+    event_start_ts: float | None = None

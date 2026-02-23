@@ -17,23 +17,31 @@ class OrderManager:
         self.open_orders[order.order_id] = order
         logger.debug("Tracking order %s (%s)", order.order_id, order.token_id)
 
-    def check_expiry(self) -> list[str]:
+    def check_expiry(self, close_before_event_sec: int = 0) -> list[OpenOrder]:
         """Cancel and remove orders that have exceeded their TTL.
 
-        Returns a list of order IDs that were cancelled.
+        Returns the list of orders that were cancelled.
         """
         now = time.time()
-        cancelled: list[str] = []
+        close_before_event_sec = max(0, int(close_before_event_sec))
+        cancelled: list[OpenOrder] = []
 
         for oid, order in list(self.open_orders.items()):
-            if now - order.placed_at > order.ttl_sec:
+            ttl_expired = now - order.placed_at > order.ttl_sec
+            is_pre_event_window = (
+                close_before_event_sec > 0
+                and order.event_start_ts is not None
+                and now >= order.event_start_ts - close_before_event_sec
+            )
+            if ttl_expired or is_pre_event_window:
                 try:
-                    self.poly.cancel_order(oid)
-                    logger.info("Cancelled expired order %s", oid)
+                    self.poly.cancel(oid)
+                    reason = "expired" if ttl_expired else "pre-event"
+                    logger.info("Cancelled %s order %s", reason, oid)
+                    del self.open_orders[oid]
+                    cancelled.append(order)
                 except Exception as e:
-                    logger.warning("Cancel failed for %s: %s", oid, e)
-                del self.open_orders[oid]
-                cancelled.append(oid)
+                    logger.warning("Cancel failed for %s — keeping tracked: %s", oid, e)
 
         return cancelled
 

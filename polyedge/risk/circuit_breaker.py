@@ -4,11 +4,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class CircuitBreaker:
-    def __init__(self, stale_timeout_sec: float = 600, max_consecutive_errors: int = 3):
+    def __init__(self, stale_timeout_sec: float = 600, max_consecutive_errors: int = 3,
+                 cooldown_sec: float = 60):
         self._stale_timeout = stale_timeout_sec
         self._max_errors = max_consecutive_errors
+        self._cooldown_sec = cooldown_sec
         self._last_odds_fetch: float = time.time()
         self._consecutive_errors: int = 0
+        self._tripped_at: float = 0.0
         self._manually_tripped: bool = False
         self.trip_reason: str = ""
 
@@ -29,6 +32,7 @@ class CircuitBreaker:
     def reset(self) -> None:
         self._manually_tripped = False
         self._consecutive_errors = 0
+        self._tripped_at = 0.0
         self.trip_reason = ""
 
     def is_tripped(self) -> bool:
@@ -38,7 +42,18 @@ class CircuitBreaker:
             self.trip_reason = "stale_odds"
             return True
         if self._consecutive_errors >= self._max_errors:
+            now = time.time()
+            if self._tripped_at == 0.0:
+                self._tripped_at = now
+            # Auto-reset after cooldown to avoid permanent deadlock
+            if now - self._tripped_at >= self._cooldown_sec:
+                logger.info("Circuit breaker auto-reset after %.0fs cooldown", self._cooldown_sec)
+                self._consecutive_errors = 0
+                self._tripped_at = 0.0
+                self.trip_reason = ""
+                return False
             self.trip_reason = "api_errors"
             return True
+        self._tripped_at = 0.0
         self.trip_reason = ""
         return False

@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+docs/
+Odds copy/
+PolyTrader_v0.1.6/
+config/.env
+firebase-debug.log

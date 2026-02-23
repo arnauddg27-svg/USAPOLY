@@ -44,6 +44,24 @@ class TestEdgeDetection:
         opps = detect_edge(matched, agg, book_a, book_b, cfg)
         assert any(o.buy_outcome == "b" for o in opps)
 
+    def test_moneyline_favorites_only_blocks_underdog_side(self):
+        matched, agg = _matched(0.40)  # side b is favorite
+        book_a = _book(0.20, 800)  # would be strong edge for underdog a
+        book_b = _book(0.70, 800)  # no edge on favorite b
+        cfg = EdgeConfig()
+        cfg.moneyline_favorites_only = True
+        opps = detect_edge(matched, agg, book_a, book_b, cfg)
+        assert opps == []
+
+    def test_disabling_moneyline_favorites_only_allows_underdog_edge(self):
+        matched, agg = _matched(0.40)  # side b is favorite
+        book_a = _book(0.20, 800)  # strong edge for underdog a
+        book_b = _book(0.70, 800)  # no edge on favorite b
+        cfg = EdgeConfig()
+        cfg.moneyline_favorites_only = False
+        opps = detect_edge(matched, agg, book_a, book_b, cfg)
+        assert any(o.buy_outcome == "a" for o in opps)
+
 class TestGates:
     def test_spread_gate_fails(self):
         cfg = EdgeConfig()

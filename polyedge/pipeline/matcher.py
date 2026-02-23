@@ -1,4 +1,8 @@
-from polyedge.models import AllBookOdds, PolyMarket, MatchedEvent
+import re
+from datetime import datetime, timezone
+
+from polyedge.data.polymarket import SPORT_TAG_SLUGS
+from polyedge.models import AllBookOdds, MatchedEvent, PolyMarket, SportsOutcome
 
 TEAM_ALIASES: dict[str, list[str]] = {
     # NBA
@@ -73,30 +77,92 @@ TEAM_ALIASES: dict[str, list[str]] = {
     "Toronto Blue Jays": ["Blue Jays"], "Washington Nationals": ["Nationals", "Nats"],
 }
 
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Gamma sports event timestamps are often stale by up to ~2 weeks.
+# Keep a broad guard to block clearly unrelated historical markets,
+# while still allowing current matchup markets with imperfect metadata.
+_MAX_START_TIME_DRIFT_SEC = 14 * 24 * 3600
 
-def _normalize(text: str) -> str:
-    """Lowercase and strip whitespace from text."""
-    return text.lower().strip()
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(str(text).lower())
+
+
+def _contains_token_sequence(needle: list[str], haystack: list[str]) -> bool:
+    if not needle or not haystack or len(needle) > len(haystack):
+        return False
+    n = len(needle)
+    return any(haystack[i:i + n] == needle for i in range(len(haystack) - n + 1))
 
 
 def _names_match(full_name: str, candidate: str) -> bool:
-    """Check if a full team name matches a candidate string.
+    """Match a canonical team name against an outcome label using token boundaries."""
+    full_tokens = _tokenize(full_name)
+    candidate_tokens = _tokenize(candidate)
+    if not full_tokens or not candidate_tokens:
+        return False
 
-    Matching strategies (in order):
-    1. Exact match (case-insensitive)
-    2. Substring match (either direction)
-    3. Alias match (check known aliases for the full name)
-    """
-    nf = _normalize(full_name)
-    nc = _normalize(candidate)
-    if nf == nc or nf in nc or nc in nf:
+    if _contains_token_sequence(full_tokens, candidate_tokens):
         return True
+
     aliases = TEAM_ALIASES.get(full_name, [])
     for alias in aliases:
-        na = _normalize(alias)
-        if na == nc or na in nc or nc in na:
+        alias_tokens = _tokenize(alias)
+        if _contains_token_sequence(alias_tokens, candidate_tokens):
             return True
-    return False
+
+    # Lightweight fallback for markets that use only the team nickname.
+    return len(candidate_tokens) == 1 and candidate_tokens[0] == full_tokens[-1]
+
+
+def _parse_iso_utc(raw: str) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _start_times_compatible(odds_commence_time: str, poly_start_iso: str) -> bool:
+    odds_start = _parse_iso_utc(odds_commence_time)
+    poly_start = _parse_iso_utc(poly_start_iso)
+    if odds_start is None or poly_start is None:
+        return True
+    drift_sec = abs((odds_start - poly_start).total_seconds())
+    return drift_sec <= _MAX_START_TIME_DRIFT_SEC
+
+
+def start_time_drift_seconds(odds_commence_time: str, poly_start_iso: str) -> float:
+    """Return absolute start-time drift in seconds, or inf if missing/unparseable."""
+    odds_start = _parse_iso_utc(odds_commence_time)
+    poly_start = _parse_iso_utc(poly_start_iso)
+    if odds_start is None or poly_start is None:
+        return float("inf")
+    return abs((odds_start - poly_start).total_seconds())
+
+
+def orient_book_outcomes(
+    team_a: str,
+    team_b: str,
+    first: SportsOutcome,
+    second: SportsOutcome,
+) -> tuple[SportsOutcome, SportsOutcome] | None:
+    """Map a bookmaker outcome pair to (team_a, team_b) orientation."""
+    a_first = _names_match(team_a, first.name)
+    b_second = _names_match(team_b, second.name)
+    if a_first and b_second:
+        return first, second
+
+    a_second = _names_match(team_a, second.name)
+    b_first = _names_match(team_b, first.name)
+    if a_second and b_first:
+        return second, first
+    return None
 
 
 def match_events(
@@ -105,34 +171,54 @@ def match_events(
 ) -> list[MatchedEvent]:
     """Match sportsbook games to Polymarket markets by team names.
 
-    For each game, attempts to find a Polymarket market where both team names
-    (home and away) match the market's outcome_a and outcome_b (in either order).
-    Uses exact matching, substring matching, and alias-based matching.
-
     Each Polymarket market is used at most once (first-come, first-served).
     """
     results: list[MatchedEvent] = []
     used_polys: set[int] = set()
     for game in games:
+        expected_slug = SPORT_TAG_SLUGS.get(game.sport, "")
+        best_index = None
+        best_match: MatchedEvent | None = None
+        best_drift = float("inf")
         for i, poly in enumerate(polys):
             if i in used_polys:
                 continue
+            # Cross-sport guard: only match within same sport
+            if expected_slug and poly.sport_tag and poly.sport_tag != expected_slug:
+                continue
+            if not _start_times_compatible(game.commence_time, poly.start_iso):
+                continue
+
             home_a = _names_match(game.home, poly.outcome_a)
             away_b = _names_match(game.away, poly.outcome_b)
             home_b = _names_match(game.home, poly.outcome_b)
             away_a = _names_match(game.away, poly.outcome_a)
             if home_a and away_b:
-                results.append(MatchedEvent(
-                    sport=game.sport, all_odds=game, poly_market=poly,
-                    team_a=game.home, team_b=game.away,
-                ))
-                used_polys.add(i)
-                break
+                candidate = MatchedEvent(
+                    sport=game.sport,
+                    all_odds=game,
+                    poly_market=poly,
+                    team_a=game.home,
+                    team_b=game.away,
+                )
             elif home_b and away_a:
-                results.append(MatchedEvent(
-                    sport=game.sport, all_odds=game, poly_market=poly,
-                    team_a=game.away, team_b=game.home,
-                ))
-                used_polys.add(i)
-                break
+                candidate = MatchedEvent(
+                    sport=game.sport,
+                    all_odds=game,
+                    poly_market=poly,
+                    team_a=game.away,
+                    team_b=game.home,
+                )
+            else:
+                continue
+
+            drift = start_time_drift_seconds(game.commence_time, poly.start_iso)
+            if best_match is None or drift < best_drift:
+                best_match = candidate
+                best_index = i
+                best_drift = drift
+
+        if best_match is not None and best_index is not None:
+            results.append(best_match)
+            used_polys.add(best_index)
     return results

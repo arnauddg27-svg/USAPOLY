@@ -29,6 +29,24 @@ SAMPLE_RESPONSE = [
     }
 ]
 
+SPREAD_ONLY_RESPONSE = [
+    {
+        "sport_key": "basketball_nba",
+        "home_team": "Boston Celtics",
+        "away_team": "Los Angeles Lakers",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "title": "DraftKings",
+                "markets": [{"key": "spreads", "outcomes": [
+                    {"name": "Boston Celtics", "price": -110, "point": -3.5},
+                    {"name": "Los Angeles Lakers", "price": -110, "point": 3.5},
+                ]}],
+            }
+        ],
+    }
+]
+
 
 class TestParseAllBooks:
     def test_parses_multiple_books(self):
@@ -68,3 +86,29 @@ class TestParseAllBooks:
         assert game.home == "Boston Celtics"
         assert game.away == "Los Angeles Lakers"
         assert game.sport == "basketball_nba"
+
+    def test_parses_spread_books_with_points(self):
+        game = parse_all_books_response(SPREAD_ONLY_RESPONSE)[0]
+        assert "DraftKings" in game.spread_books
+        spread_a, spread_b = game.spread_books["DraftKings"]
+        assert spread_a.name == "Boston Celtics (-3.5)"
+        assert spread_b.name == "Los Angeles Lakers (+3.5)"
+        assert spread_a.american_odds == -110
+        assert spread_b.american_odds == -110
+
+    def test_skips_malformed_outcome_rows(self):
+        data = [{
+            "sport_key": "basketball_nba",
+            "home_team": "A",
+            "away_team": "B",
+            "commence_time": "2026-01-01T00:00:00Z",
+            "bookmakers": [{
+                "title": "BadBook",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "A", "price": "x"},
+                    {"name": "B", "price": 110},
+                ]}],
+            }],
+        }]
+        result = parse_all_books_response(data)
+        assert result == []

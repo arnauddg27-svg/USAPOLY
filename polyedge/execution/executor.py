@@ -11,6 +11,7 @@ class EdgeExecutor:
 
     def __init__(self, poly_client):
         self.poly = poly_client
+        self.last_error = ""
 
     def place_order(self, opp: EdgeOpportunity, cfg: EdgeConfig) -> OpenOrder | None:
         """Build and submit a limit BUY order for the given opportunity.
@@ -20,46 +21,95 @@ class EdgeExecutor:
         """
         if not cfg.trading_enabled:
             logger.info("Trading disabled — skipping %s", opp.buy_token_id)
+            self.last_error = "trading_disabled"
             return None
 
         if opp.bet_usd <= 0 or opp.shares <= 0:
             logger.debug(
                 "Skipping order: bet_usd=%.2f shares=%d", opp.bet_usd, opp.shares
             )
+            self.last_error = "invalid_order_size"
             return None
 
-        # Place the limit slightly below mid to avoid crossing the spread
-        limit_price = round(opp.poly_mid - cfg.order_offset, 4)
+        # Two execution modes:
+        # - resting quotes: maker-only post-only near mid
+        # - no-resting: aggressive capped-price buy + immediate cancel of remainder (IOC-like)
+        if cfg.no_resting_orders:
+            limit_price = round(float(opp.poly_fill_price), 4)
+        else:
+            limit_price = round(opp.poly_mid - cfg.order_offset, 4)
         limit_price = max(0.01, min(0.99, limit_price))
 
         try:
-            result = self.poly.post_order(
-                token_id=opp.buy_token_id,
-                side="BUY",
-                price=limit_price,
-                size=opp.shares,
-                post_only=True,
-            )
+            from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+
+            if cfg.no_resting_orders:
+                # Use true taker-style execution with immediate-or-cancel semantics.
+                signed = self.poly.create_market_order(
+                    MarketOrderArgs(
+                        token_id=opp.buy_token_id,
+                        amount=round(float(opp.bet_usd), 6),
+                        side=BUY,
+                        price=limit_price,
+                        order_type=OrderType.FOK,
+                    )
+                )
+                result = self.poly.post_order(
+                    signed,
+                    orderType=OrderType.FOK,
+                    post_only=False,
+                )
+            else:
+                signed = self.poly.create_order(
+                    OrderArgs(
+                        price=limit_price,
+                        size=opp.shares,
+                        side=BUY,
+                        token_id=opp.buy_token_id,
+                    )
+                )
+                result = self.poly.post_order(
+                    signed,
+                    orderType=OrderType.GTC,
+                    post_only=True,
+                )
         except Exception as e:
+            self.last_error = str(e)
             logger.error("Order failed for %s: %s", opp.buy_token_id, e)
             return None
 
-        if not result or not result.get("ok"):
-            logger.warning("Order rejected for %s: %s", opp.buy_token_id, result)
+        if not result:
+            self.last_error = "empty_response"
+            logger.warning("Order rejected for %s: empty response", opp.buy_token_id)
             return None
 
-        order_id = result.get("orderID", result.get("order_id", ""))
+        if not isinstance(result, dict):
+            self.last_error = f"non_dict_response:{type(result).__name__}"
+            logger.warning("Order rejected for %s: unexpected response type %s",
+                           opp.buy_token_id, type(result).__name__)
+            return None
+
+        order_id = str(result.get("orderID", result.get("order_id", result.get("orderId", "")))).strip()
+        if not order_id:
+            self.last_error = "missing_order_id"
+            logger.warning("Order rejected for %s: missing order id in response %s",
+                           opp.buy_token_id, result)
+            return None
+        self.last_error = ""
 
         order = OpenOrder(
             order_id=order_id,
             token_id=opp.buy_token_id,
             condition_id=opp.matched_event.poly_market.condition_id,
+            sport=opp.matched_event.sport,
             side="BUY",
             price=limit_price,
             size=opp.shares,
             placed_at=time.time(),
             ttl_sec=cfg.order_ttl_sec,
             original_edge=opp.adjusted_edge,
+            amount_usd=round(float(opp.bet_usd), 2),
         )
 
         logger.info(

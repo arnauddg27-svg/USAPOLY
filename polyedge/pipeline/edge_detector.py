@@ -65,11 +65,19 @@ def detect_edge(
     """
     opportunities = []
     target = cfg.target_shares
+    moneyline_favorites_only = (
+        getattr(matched.poly_market, "market_type", "moneyline") == "moneyline"
+        and cfg.moneyline_favorites_only
+    )
+    favorite_side = "a" if agg.prob_a >= agg.prob_b else "b"
 
     for side, true_prob, book, token_id in [
         ("a", agg.prob_a, book_a, matched.poly_market.token_id_a),
         ("b", agg.prob_b, book_b, matched.poly_market.token_id_b),
     ]:
+        if moneyline_favorites_only and side != favorite_side:
+            continue
+
         fill_price, filled = compute_avg_fill_price(book.asks, target)
         if filled <= 0:
             continue
