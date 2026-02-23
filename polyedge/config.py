@@ -55,7 +55,7 @@ CONFIG_FIELDS = [
     ("CLAIM_MAX_PER_CYCLE",    "claim_max_per_cycle",    int,   1),
     ("CHASE_TOLERANCE",        "chase_tolerance",        float, 0.01),
     ("MAX_RETRIES",            "max_retries",            int,   3),
-    ("SPORTS",                 "sports",                 list,  ["basketball_nba","americanfootball_nfl","baseball_mlb","icehockey_nhl"]),
+    ("SPORTS",                 "sports",                 list,  ["basketball_nba","americanfootball_nfl","baseball_mlb","icehockey_nhl","soccer_epl","tennis_atp"]),
     ("POLY_API_KEY",           "poly_api_key",           str,   ""),
     ("POLY_API_SECRET",        "poly_api_secret",        str,   ""),
     ("POLY_API_PASSPHRASE",    "poly_api_passphrase",    str,   ""),
@@ -102,7 +102,7 @@ class EdgeConfig:
     claim_max_per_cycle: int = 1
     chase_tolerance: float = 0.01
     max_retries: int = 3
-    sports: list = field(default_factory=lambda: ["basketball_nba","americanfootball_nfl","baseball_mlb","icehockey_nhl"])
+    sports: list = field(default_factory=lambda: ["basketball_nba","americanfootball_nfl","baseball_mlb","icehockey_nhl","soccer_epl","tennis_atp"])
     poly_api_key: str = ""
     poly_api_secret: str = ""
     poly_api_passphrase: str = ""

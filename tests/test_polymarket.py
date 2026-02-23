@@ -5,6 +5,7 @@ from polyedge.data.polymarket import (
     _extract_tradeable_markets,
     _parse_book_levels,
     _parse_outcomes_tokens,
+    sport_to_tag_slug,
 )
 
 class TestFillSimulation:
@@ -134,3 +135,14 @@ class TestBookLevelParsing:
         assert len(levels) == 1
         assert levels[0].price == 0.45
         assert levels[0].size == 120
+
+
+class TestSportSlugResolution:
+    def test_exact_supported_sport_slug(self):
+        assert sport_to_tag_slug("basketball_nba") == "nba"
+
+    def test_soccer_prefix_maps_to_soccer_tag(self):
+        assert sport_to_tag_slug("soccer_epl") == "soccer"
+
+    def test_tennis_prefix_maps_to_tennis_tag(self):
+        assert sport_to_tag_slug("tennis_atp") == "tennis"

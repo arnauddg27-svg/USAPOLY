@@ -19,6 +19,20 @@ SPORT_TAG_SLUGS = {
     "mma_mixed_martial_arts": "ufc",
 }
 
+
+def sport_to_tag_slug(sport_key: str) -> str:
+    """Resolve an Odds API sport key to a Polymarket Gamma tag slug."""
+    key = str(sport_key or "").strip().lower()
+    if not key:
+        return ""
+    if key in SPORT_TAG_SLUGS:
+        return SPORT_TAG_SLUGS[key]
+    if key.startswith("soccer_"):
+        return "soccer"
+    if key.startswith("tennis_"):
+        return "tennis"
+    return ""
+
 _SPREAD_PATTERN = re.compile(r"[+-]\s*\d+(?:\.\d+)?")
 _NUMERIC_PARENS_PATTERN = re.compile(r"\(\s*[+-]?\s*\d+(?:\.\d+)?\s*\)")
 _MONEYLINE_HINTS = (
@@ -182,7 +196,7 @@ async def fetch_sports_markets(sports: list[str]) -> list[PolyMarket]:
     seen_slugs = set()
     slugs = []
     for s in sports:
-        slug = SPORT_TAG_SLUGS.get(s)
+        slug = sport_to_tag_slug(s)
         if slug and slug not in seen_slugs:
             slugs.append(slug)
             seen_slugs.add(slug)

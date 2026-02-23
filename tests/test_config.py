@@ -16,6 +16,8 @@ def test_config_loads_defaults():
     assert cfg.no_resting_orders is True
     assert cfg.close_orders_before_event_sec == 300
     assert cfg.devig_method == "power"
+    assert "soccer_epl" in cfg.sports
+    assert "tennis_atp" in cfg.sports
 
 def test_config_loads_from_env(monkeypatch):
     monkeypatch.setenv("TRADING_ENABLED", "true")

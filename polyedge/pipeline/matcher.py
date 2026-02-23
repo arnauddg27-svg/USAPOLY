@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timezone
 
-from polyedge.data.polymarket import SPORT_TAG_SLUGS
+from polyedge.data.polymarket import sport_to_tag_slug
 from polyedge.models import AllBookOdds, MatchedEvent, PolyMarket, SportsOutcome
 
 TEAM_ALIASES: dict[str, list[str]] = {
@@ -176,7 +176,7 @@ def match_events(
     results: list[MatchedEvent] = []
     used_polys: set[int] = set()
     for game in games:
-        expected_slug = SPORT_TAG_SLUGS.get(game.sport, "")
+        expected_slug = sport_to_tag_slug(game.sport)
         best_index = None
         best_match: MatchedEvent | None = None
         best_drift = float("inf")
