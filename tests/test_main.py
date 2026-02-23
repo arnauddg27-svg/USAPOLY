@@ -298,6 +298,56 @@ def test_slow_cycle_uses_spread_books_for_spread_markets(monkeypatch):
     assert agg.books_used == 1
 
 
+def test_slow_cycle_falls_back_to_two_books_when_strict_threshold_empty(monkeypatch):
+    bot = PolyEdgeBot()
+    bot.cfg.min_books = 6
+    bot.cfg.devig_method = "power"
+
+    game = AllBookOdds(
+        sport="basketball_nba",
+        home="Chicago Bulls",
+        away="Miami Heat",
+        commence_time="2099-01-01T00:00:00Z",
+        books={
+            "BookA": (
+                SportsOutcome("Chicago Bulls", -110, "BookA"),
+                SportsOutcome("Miami Heat", -110, "BookA"),
+            ),
+            "BookB": (
+                SportsOutcome("Chicago Bulls", -112, "BookB"),
+                SportsOutcome("Miami Heat", -108, "BookB"),
+            ),
+        },
+    )
+    market = PolyMarket(
+        event_title="Bulls vs Heat",
+        condition_id="cond-fallback",
+        outcome_a="Chicago Bulls",
+        outcome_b="Miami Heat",
+        token_id_a="tok-a",
+        token_id_b="tok-b",
+        market_type="moneyline",
+        sport_tag="nba",
+    )
+
+    async def _fake_all_odds(_sports, _api_key):
+        return [game]
+
+    async def _fake_polys(_sports):
+        return [market]
+
+    monkeypatch.setattr("polyedge.main.fetch_all_odds", _fake_all_odds)
+    monkeypatch.setattr("polyedge.main.fetch_sports_markets", _fake_polys)
+
+    asyncio.run(bot._slow_cycle())
+
+    agg_cache = bot.odds_cache.get("aggregated") or {}
+    agg = agg_cache.get("cond-fallback")
+    assert agg is not None
+    assert agg.books_used == 2
+    assert bot.cfg.min_books == 2
+
+
 def test_fast_cycle_blocks_opposite_side_for_same_condition(monkeypatch):
     bot = PolyEdgeBot()
     bot.cfg.simulation_mode = False

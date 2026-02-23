@@ -31,14 +31,14 @@ CONFIG_FIELDS = [
     ("SIMULATION_START_BANKROLL", "simulation_start_bankroll", float, 1000.0),
     ("POLL_INTERVAL_SEC",      "poll_interval_sec",      int,   10),
     ("SLOW_CYCLE_MULTIPLIER",  "slow_cycle_multiplier",  int,   12),
-    ("MIN_EDGE_PP",            "min_edge",               float, 0.05),
-    ("MIN_BOOKS",              "min_books",              int,   6),
+    ("MIN_EDGE_PP",            "min_edge",               float, 0.03),
+    ("MIN_BOOKS",              "min_books",              int,   4),
     ("DEVIG_METHOD",           "devig_method",           str,   "power"),
     ("SAFETY_HAIRCUT",         "safety_haircut",         float, 0.01),
-    ("MAX_SLIPPAGE",           "max_slippage",           float, 0.01),
-    ("MAX_SPREAD",             "max_spread",             float, 0.01),
+    ("MAX_SLIPPAGE",           "max_slippage",           float, 0.02),
+    ("MAX_SPREAD",             "max_spread",             float, 0.02),
     ("MIN_HOURS_BEFORE_EVENT", "min_hours_before_event", float, 1.0),
-    ("MONEYLINE_FAVORITES_ONLY", "moneyline_favorites_only", bool, True),
+    ("MONEYLINE_FAVORITES_ONLY", "moneyline_favorites_only", bool, False),
     ("FRACTION_KELLY",         "fraction_kelly",         float, 0.15),
     ("MAX_PER_EVENT_PCT",      "max_per_event_pct",      float, 0.02),
     ("MAX_PER_SPORT_PCT",      "max_per_sport_pct",      float, 0.10),
@@ -68,7 +68,7 @@ CONFIG_FIELDS = [
     ("DASHBOARD_PORT",         "dashboard_port",         int,   8502),
     ("DASHBOARD_PASSWORD",     "dashboard_password",     str,   ""),
     ("FEE_RATE",               "fee_rate",               float, 0.0),
-    ("TARGET_SHARES",          "target_shares",          float, 500.0),
+    ("TARGET_SHARES",          "target_shares",          float, 150.0),
 ]
 
 @dataclass
@@ -78,14 +78,14 @@ class EdgeConfig:
     simulation_start_bankroll: float = 1000.0
     poll_interval_sec: int = 10
     slow_cycle_multiplier: int = 12
-    min_edge: float = 0.05
-    min_books: int = 6
+    min_edge: float = 0.03
+    min_books: int = 4
     devig_method: str = "power"
     safety_haircut: float = 0.01
-    max_slippage: float = 0.01
-    max_spread: float = 0.01
+    max_slippage: float = 0.02
+    max_spread: float = 0.02
     min_hours_before_event: float = 1.0
-    moneyline_favorites_only: bool = True
+    moneyline_favorites_only: bool = False
     fraction_kelly: float = 0.15
     max_per_event_pct: float = 0.02
     max_per_sport_pct: float = 0.10
@@ -115,7 +115,7 @@ class EdgeConfig:
     dashboard_port: int = 8502
     dashboard_password: str = ""
     fee_rate: float = 0.0
-    target_shares: float = 500.0
+    target_shares: float = 150.0
     runtime_config_path: str = str(RUNTIME_CONFIG_PATH)
 
     @classmethod

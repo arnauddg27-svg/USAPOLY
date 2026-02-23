@@ -381,40 +381,64 @@ class PolyEdgeBot:
         odds_games_by_sport = Counter(g.sport for g in all_odds)
         matches_by_sport = Counter(m.sport for m in matches)
 
-        agg_cache = {}
-        aggregated_by_sport = Counter()
-        aggregated_by_market_type = Counter()
-        for m in matches:
-            lines = []
-            market_type = getattr(m.poly_market, "market_type", "moneyline")
-            source_books = (
-                m.all_odds.spread_books
-                if market_type == "spread"
-                else m.all_odds.books
-            )
-            for bk_name, (out_a, out_b) in source_books.items():
-                oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
-                if oriented is None:
-                    continue
-                team_a_outcome, team_b_outcome = oriented
-                p_a, p_b = devig(
-                    team_a_outcome.decimal_odds,
-                    team_b_outcome.decimal_odds,
-                    self.cfg.devig_method,
+        def _build_aggregates(min_books: int):
+            cache = {}
+            by_sport = Counter()
+            by_market_type = Counter()
+            for m in matches:
+                lines = []
+                market_type = getattr(m.poly_market, "market_type", "moneyline")
+                source_books = (
+                    m.all_odds.spread_books
+                    if market_type == "spread"
+                    else m.all_odds.books
                 )
-                lines.append(
-                    BookLine(
-                        bookmaker=bk_name,
-                        prob_a=p_a,
-                        prob_b=p_b,
-                        method=self.cfg.devig_method,
+                for bk_name, (out_a, out_b) in source_books.items():
+                    oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
+                    if oriented is None:
+                        continue
+                    team_a_outcome, team_b_outcome = oriented
+                    p_a, p_b = devig(
+                        team_a_outcome.decimal_odds,
+                        team_b_outcome.decimal_odds,
+                        self.cfg.devig_method,
                     )
+                    lines.append(
+                        BookLine(
+                            bookmaker=bk_name,
+                            prob_a=p_a,
+                            prob_b=p_b,
+                            method=self.cfg.devig_method,
+                        )
+                    )
+                agg = aggregate_probs(lines, min_books=min_books)
+                if agg:
+                    cache[m.poly_market.condition_id] = agg
+                    by_sport[m.sport] += 1
+                    by_market_type[market_type] += 1
+            return cache, by_sport, by_market_type
+
+        required_books = max(1, int(self.cfg.min_books))
+        agg_cache, aggregated_by_sport, aggregated_by_market_type = _build_aggregates(
+            required_books
+        )
+        # Adaptive fallback: if strict min-book settings yield no markets,
+        # temporarily relax to keep the engine producing decisions.
+        if not agg_cache and matches and required_books > 2:
+            fallback_books = 2
+            fallback_cache, fallback_by_sport, fallback_by_market_type = _build_aggregates(
+                fallback_books
+            )
+            if fallback_cache:
+                logger.warning(
+                    "No events met MIN_BOOKS=%d; temporarily using MIN_BOOKS=%d for this cycle",
+                    required_books,
+                    fallback_books,
                 )
-            agg = aggregate_probs(lines, min_books=self.cfg.min_books)
-            if agg:
-                agg_cache[m.poly_market.condition_id] = agg
-                aggregated_by_sport[m.sport] += 1
-                aggregated_by_market_type[market_type] += 1
+                self.cfg.min_books = fallback_books
+                agg_cache = fallback_cache
+                aggregated_by_sport = fallback_by_sport
+                aggregated_by_market_type = fallback_by_market_type
         self.odds_cache.set("aggregated", agg_cache)
         self.coverage = {
             "odds_games_by_sport": dict(odds_games_by_sport),

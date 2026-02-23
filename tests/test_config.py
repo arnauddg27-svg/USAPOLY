@@ -9,9 +9,9 @@ def test_config_loads_defaults():
     assert cfg.simulation_mode is True
     assert cfg.simulation_start_bankroll == 1000.0
     assert cfg.poll_interval_sec == 10
-    assert cfg.min_edge == 0.05
-    assert cfg.min_books == 6
-    assert cfg.moneyline_favorites_only is True
+    assert cfg.min_edge == 0.03
+    assert cfg.min_books == 4
+    assert cfg.moneyline_favorites_only is False
     assert cfg.fraction_kelly == 0.15
     assert cfg.no_resting_orders is True
     assert cfg.close_orders_before_event_sec == 300
@@ -45,7 +45,7 @@ def test_config_sports_parsing(monkeypatch):
 def test_config_invalid_numeric_env_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("MIN_EDGE_PP", "not-a-number")
     cfg = EdgeConfig.from_env()
-    assert cfg.min_edge == 0.05
+    assert cfg.min_edge == 0.03
 
 
 def test_runtime_config_path_is_absolute():
