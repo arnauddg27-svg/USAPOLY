@@ -1220,11 +1220,11 @@ with tab_config:
             st.markdown("**Risk/Sizing**")
             min_edge = st.number_input(
                 "Min Edge (pp)",
-                min_value=0.01,
+                min_value=0.001,
                 max_value=0.50,
                 value=float(current.get("MIN_EDGE_PP", 0.05)),
-                step=0.01,
-                format="%.2f",
+                step=0.001,
+                format="%.3f",
             )
             max_spread = st.number_input(
                 "Spread Aggressiveness (max spread)",

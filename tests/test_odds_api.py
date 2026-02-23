@@ -1,5 +1,5 @@
 import pytest
-from polyedge.data.odds_api import parse_all_books_response
+from polyedge.data.odds_api import expand_sport_keys, parse_all_books_response
 from polyedge.models import AllBookOdds
 
 SAMPLE_RESPONSE = [
@@ -112,3 +112,44 @@ class TestParseAllBooks:
         }]
         result = parse_all_books_response(data)
         assert result == []
+
+
+class TestSportExpansion:
+    def test_expands_soccer_and_tennis_wildcards(self):
+        requested = ["soccer_all", "tennis_all"]
+        available = [
+            "basketball_nba",
+            "soccer_epl",
+            "soccer_uefa_champs_league",
+            "tennis_atp_us_open",
+            "tennis_wta_french_open",
+        ]
+        resolved = expand_sport_keys(requested, available)
+        assert resolved == [
+            "soccer_epl",
+            "soccer_uefa_champs_league",
+            "tennis_atp_us_open",
+            "tennis_wta_french_open",
+        ]
+
+    def test_wildcard_expansion_preserves_order_and_deduplicates(self):
+        requested = ["soccer_all", "soccer_epl", "tennis_all", "tennis_wta_french_open"]
+        available = [
+            "soccer_epl",
+            "soccer_spain_la_liga",
+            "tennis_wta_french_open",
+            "tennis_atp_us_open",
+        ]
+        resolved = expand_sport_keys(requested, available)
+        assert resolved == [
+            "soccer_epl",
+            "soccer_spain_la_liga",
+            "tennis_wta_french_open",
+            "tennis_atp_us_open",
+        ]
+
+    def test_non_wildcard_tokens_are_kept(self):
+        requested = ["basketball_nba", "soccer_all"]
+        available = ["soccer_epl"]
+        resolved = expand_sport_keys(requested, available)
+        assert resolved == ["basketball_nba", "soccer_epl"]

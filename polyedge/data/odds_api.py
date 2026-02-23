@@ -14,6 +14,12 @@ from polyedge.models import AllBookOdds, SportsOutcome
 logger = logging.getLogger(__name__)
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+_SPORT_WILDCARDS = {
+    "soccer_all": "soccer_",
+    "soccer_*": "soccer_",
+    "tennis_all": "tennis_",
+    "tennis_*": "tennis_",
+}
 
 
 def _format_name_with_point(name: str, point) -> str:
@@ -96,6 +102,60 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
     return results
 
 
+def expand_sport_keys(requested_sports: list[str], available_sports: list[str]) -> list[str]:
+    """Expand wildcard sport tokens into concrete The Odds API sport keys."""
+    available: list[str] = []
+    seen_available: set[str] = set()
+    for raw in available_sports:
+        key = str(raw or "").strip().lower()
+        if not key or key in seen_available:
+            continue
+        seen_available.add(key)
+        available.append(key)
+
+    resolved: list[str] = []
+    seen_resolved: set[str] = set()
+    for raw in requested_sports:
+        token = str(raw or "").strip().lower()
+        if not token:
+            continue
+        wildcard_prefix = _SPORT_WILDCARDS.get(token)
+        if wildcard_prefix is None:
+            if token not in seen_resolved:
+                seen_resolved.add(token)
+                resolved.append(token)
+            continue
+        for key in available:
+            if key.startswith(wildcard_prefix) and key not in seen_resolved:
+                seen_resolved.add(key)
+                resolved.append(key)
+    return resolved
+
+
+async def _fetch_available_sport_keys(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    """Return all available sport keys from The Odds API."""
+    try:
+        async with session.get(f"{ODDS_API_BASE}/sports", params={"apiKey": api_key}) as resp:
+            if resp.status != 200:
+                logger.warning("Odds API sports list returned %d", resp.status)
+                return []
+            payload = await resp.json()
+            if not isinstance(payload, list):
+                logger.warning("Odds API sports list returned non-list payload")
+                return []
+            keys: list[str] = []
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("key") or "").strip().lower()
+                if key:
+                    keys.append(key)
+            return keys
+    except Exception as exc:
+        logger.warning("Odds API sports list fetch failed: %s", exc)
+        return []
+
+
 async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
     """Fetch odds for all configured sports, keeping all bookmakers.
 
@@ -109,14 +169,40 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
     if not api_key:
         logger.warning("ODDS_API_KEY missing — skipping odds fetch")
         return []
+    requested_sports = [str(s).strip() for s in sports if str(s).strip()]
+    if not requested_sports:
+        return []
 
     all_games: list[AllBookOdds] = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        for sport in sports:
+        resolved_sports = requested_sports
+        if any(str(s).strip().lower() in _SPORT_WILDCARDS for s in requested_sports):
+            available_keys = await _fetch_available_sport_keys(session, api_key)
+            expanded = expand_sport_keys(requested_sports, available_keys)
+            if expanded:
+                resolved_sports = expanded
+                logger.info(
+                    "Expanded sports from %s to %s",
+                    requested_sports,
+                    resolved_sports,
+                )
+            else:
+                resolved_sports = [
+                    s for s in requested_sports if str(s).strip().lower() not in _SPORT_WILDCARDS
+                ]
+                if not resolved_sports:
+                    logger.warning(
+                        "No concrete sports resolved from wildcard config: %s",
+                        requested_sports,
+                    )
+                    return []
+
+        for sport in resolved_sports:
             url = f"{ODDS_API_BASE}/sports/{sport}/odds/"
             params = {
                 "apiKey": api_key,
-                "regions": "us",
+                # Include major soccer/tennis bookmaker regions by default.
+                "regions": "us,uk,eu",
                 "markets": "h2h,spreads",
                 "oddsFormat": "american",
             }
