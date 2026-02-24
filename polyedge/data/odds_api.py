@@ -22,6 +22,11 @@ _SPORT_WILDCARDS = {
 }
 
 
+def _looks_like_outright_key(key: str) -> bool:
+    k = str(key or "").strip().lower()
+    return k.endswith("_winner") or "_winner_" in k
+
+
 def _format_name_with_point(name: str, point) -> str:
     try:
         point_val = float(point)
@@ -132,6 +137,30 @@ def expand_sport_keys(requested_sports: list[str], available_sports: list[str]) 
     return resolved
 
 
+def _extract_available_sport_keys(payload: list[dict]) -> list[str]:
+    """Normalize and filter available sport keys from /sports payload."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key") or "").strip().lower()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        # Keep regular sport keys even if the league also offers outrights.
+        # Only exclude explicit outright-only keys.
+        if _looks_like_outright_key(key):
+            continue
+        active = row.get("active")
+        if isinstance(active, bool) and not active:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
 async def _fetch_available_sport_keys(session: aiohttp.ClientSession, api_key: str) -> list[str]:
     """Return all available sport keys from The Odds API."""
     try:
@@ -143,14 +172,7 @@ async def _fetch_available_sport_keys(session: aiohttp.ClientSession, api_key: s
             if not isinstance(payload, list):
                 logger.warning("Odds API sports list returned non-list payload")
                 return []
-            keys: list[str] = []
-            for row in payload:
-                if not isinstance(row, dict):
-                    continue
-                key = str(row.get("key") or "").strip().lower()
-                if key:
-                    keys.append(key)
-            return keys
+            return _extract_available_sport_keys(payload)
     except Exception as exc:
         logger.warning("Odds API sports list fetch failed: %s", exc)
         return []
@@ -208,10 +230,38 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
             }
             try:
                 async with session.get(url, params=params) as resp:
-                    if resp.status != 200:
-                        logger.warning("Odds API returned %d for %s", resp.status, sport)
+                    status = resp.status
+                    data = None
+                    if status == 200:
+                        data = await resp.json()
+                    elif status == 422:
+                        retry_params = dict(params)
+                        retry_params["markets"] = "h2h"
+                        logger.info("Odds API 422 for %s with spreads; retrying h2h only", sport)
+                        async with session.get(url, params=retry_params) as retry_resp:
+                            if retry_resp.status == 200:
+                                data = await retry_resp.json()
+                            elif retry_resp.status in {404, 422}:
+                                logger.info(
+                                    "Skipping unsupported odds sport=%s status=%d",
+                                    sport,
+                                    retry_resp.status,
+                                )
+                                continue
+                            else:
+                                logger.warning(
+                                    "Odds API returned %d for %s (h2h retry)",
+                                    retry_resp.status,
+                                    sport,
+                                )
+                                continue
+                    elif status in {404}:
+                        logger.info("Skipping unsupported odds sport=%s status=%d", sport, status)
                         continue
-                    data = await resp.json()
+                    else:
+                        logger.warning("Odds API returned %d for %s", status, sport)
+                        continue
+
                     if not isinstance(data, list):
                         logger.warning("Odds API returned non-list payload for %s", sport)
                         continue

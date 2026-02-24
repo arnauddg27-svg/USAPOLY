@@ -1,5 +1,5 @@
 import pytest
-from polyedge.data.odds_api import expand_sport_keys, parse_all_books_response
+from polyedge.data.odds_api import _extract_available_sport_keys, expand_sport_keys, parse_all_books_response
 from polyedge.models import AllBookOdds
 
 SAMPLE_RESPONSE = [
@@ -153,3 +153,32 @@ class TestSportExpansion:
         available = ["soccer_epl"]
         resolved = expand_sport_keys(requested, available)
         assert resolved == ["basketball_nba", "soccer_epl"]
+
+
+class TestAvailableSportsExtraction:
+    def test_keeps_matchup_keys_when_has_outrights_true(self):
+        payload = [
+            {"key": "soccer_epl", "active": True, "has_outrights": True},
+            {"key": "tennis_atp_us_open", "active": True, "has_outrights": True},
+        ]
+        keys = _extract_available_sport_keys(payload)
+        assert keys == ["soccer_epl", "tennis_atp_us_open"]
+
+    def test_filters_outright_only_keys(self):
+        payload = [
+            {"key": "soccer_epl_winner", "active": True},
+            {"key": "tennis_atp_winner_outright", "active": True},
+            {"key": "soccer_uefa_champs_league", "active": True},
+        ]
+        keys = _extract_available_sport_keys(payload)
+        assert keys == ["soccer_uefa_champs_league"]
+
+    def test_filters_inactive_and_deduplicates(self):
+        payload = [
+            {"key": "soccer_epl", "active": False},
+            {"key": "soccer_epl", "active": True},
+            {"key": "basketball_nba"},
+            {"key": "basketball_nba"},
+        ]
+        keys = _extract_available_sport_keys(payload)
+        assert keys == ["soccer_epl", "basketball_nba"]
