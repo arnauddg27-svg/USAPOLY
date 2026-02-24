@@ -931,6 +931,60 @@ with tab_overview:
                     )
                     st.caption(f"Aggregated by market type: {mt}")
 
+        fast_cycle = health.get("last_fast_cycle")
+        if isinstance(fast_cycle, dict) and fast_cycle:
+            diag_order = [
+                "cycle",
+                "status",
+                "matches_total",
+                "with_agg",
+                "opportunities",
+                "submitted",
+                "rejected",
+                "simulated",
+                "dry_run",
+                "skipped_no_agg",
+                "skipped_order_book_fetch",
+                "skipped_event_started",
+                "skipped_pre_event_window",
+                "skipped_no_edge_or_gates",
+                "skipped_bet_too_small",
+                "skipped_exposure",
+                "skipped_opposite_side_locked",
+                "blocked_circuit_breaker",
+                "blocked_bankroll_unavailable",
+                "blocked_bankroll_zero",
+                "trip_reason",
+            ]
+            diag_rows: list[dict] = []
+            for key in diag_order:
+                if key not in fast_cycle:
+                    continue
+                value = fast_cycle.get(key)
+                if key == "trip_reason" and not value:
+                    continue
+                diag_rows.append({"metric": key, "value": value})
+            if diag_rows:
+                with st.expander("Last Fast Cycle Diagnostics", expanded=True):
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+                    if int(fast_cycle.get("submitted", 0) or 0) == 0:
+                        blockers = []
+                        if int(fast_cycle.get("blocked_circuit_breaker", 0) or 0) > 0:
+                            reason = str(fast_cycle.get("trip_reason") or "unknown")
+                            blockers.append(f"circuit breaker ({reason})")
+                        if int(fast_cycle.get("blocked_bankroll_unavailable", 0) or 0) > 0:
+                            blockers.append("bankroll unavailable")
+                        if int(fast_cycle.get("blocked_bankroll_zero", 0) or 0) > 0:
+                            blockers.append("bankroll is zero")
+                        if int(fast_cycle.get("skipped_no_edge_or_gates", 0) or 0) > 0:
+                            blockers.append("no opportunities passed edge/gates")
+                        if int(fast_cycle.get("skipped_bet_too_small", 0) or 0) > 0:
+                            blockers.append("bet size computed to zero")
+                        if int(fast_cycle.get("skipped_exposure", 0) or 0) > 0:
+                            blockers.append("exposure limits blocked")
+                        if blockers:
+                            st.caption("Why no order this cycle: " + ", ".join(blockers) + ".")
+
     base_a, base_b, base_c, base_d = st.columns(4)
     if sim_mode:
         base_a.metric("Paper Bankroll", _fmt_usd(current_bankroll), _fmt_pct(pnl_pct))

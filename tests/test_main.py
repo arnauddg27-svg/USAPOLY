@@ -431,3 +431,38 @@ def test_fast_cycle_skips_started_events(monkeypatch):
     asyncio.run(bot._fast_cycle())
 
     bot.executor.place_order.assert_not_called()
+
+
+def test_fast_cycle_records_skip_stats_when_no_aggregate_available():
+    bot = PolyEdgeBot()
+    game = AllBookOdds("basketball_nba", "A", "B", "2099-01-01T00:00:00Z", {})
+    market = PolyMarket("A vs B", "cond-no-agg", "A", "B", "tok-a", "tok-b")
+    matched = MatchedEvent("basketball_nba", game, market, "A", "B")
+
+    bot.match_cache.set("matches", [matched])
+    bot.odds_cache.set("aggregated", {})
+
+    asyncio.run(bot._fast_cycle())
+
+    stats = bot.last_fast_cycle
+    assert stats["status"] == "completed"
+    assert stats["matches_total"] == 1
+    assert stats["with_agg"] == 0
+    assert stats["skipped_no_agg"] == 1
+    assert stats["submitted"] == 0
+
+
+def test_fast_cycle_records_bankroll_blocker_for_live_mode(monkeypatch):
+    bot = PolyEdgeBot()
+    bot.cfg.simulation_mode = False
+    bot.cfg.trading_enabled = True
+    bot.executor = MagicMock()
+    bot.poly_client = object()
+    bot.match_cache.set("matches", [])
+    monkeypatch.setattr(bot, "_get_bankroll", lambda: None)
+
+    asyncio.run(bot._fast_cycle())
+
+    stats = bot.last_fast_cycle
+    assert stats["status"] == "blocked_bankroll_unavailable"
+    assert stats["blocked_bankroll_unavailable"] == 1

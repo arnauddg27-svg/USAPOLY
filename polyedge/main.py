@@ -119,6 +119,7 @@ class PolyEdgeBot:
             "aggregated_by_sport": {},
             "aggregated_by_market_type": {},
         }
+        self.last_fast_cycle: dict[str, int | str] = {}
 
     def _is_live_mode(self) -> bool:
         return (
@@ -229,6 +230,7 @@ class PolyEdgeBot:
                 "matches_by_sport": self.coverage.get("matches_by_sport", {}),
                 "aggregated_by_sport": self.coverage.get("aggregated_by_sport", {}),
                 "aggregated_by_market_type": self.coverage.get("aggregated_by_market_type", {}),
+                "last_fast_cycle": self.last_fast_cycle,
             }
             if exchange_open_orders_count is not None:
                 payload["exchange_open_orders_count"] = int(exchange_open_orders_count)
@@ -461,6 +463,29 @@ class PolyEdgeBot:
 
     async def _fast_cycle(self):
         """Check edges and execute (every 10s)."""
+        cycle_stats: dict[str, int | str] = {
+            "cycle": int(self.cycle),
+            "status": "started",
+            "matches_total": 0,
+            "with_agg": 0,
+            "opportunities": 0,
+            "submitted": 0,
+            "rejected": 0,
+            "simulated": 0,
+            "dry_run": 0,
+            "skipped_no_agg": 0,
+            "skipped_order_book_fetch": 0,
+            "skipped_event_started": 0,
+            "skipped_pre_event_window": 0,
+            "skipped_no_edge_or_gates": 0,
+            "skipped_opposite_side_locked": 0,
+            "skipped_bet_too_small": 0,
+            "skipped_exposure": 0,
+            "blocked_circuit_breaker": 0,
+            "blocked_bankroll_unavailable": 0,
+            "blocked_bankroll_zero": 0,
+            "trip_reason": "",
+        }
         close_before_event_sec = max(0, int(self.cfg.close_orders_before_event_sec))
         # Always process TTL expiry, even if trading is temporarily blocked.
         if self.order_mgr:
@@ -473,29 +498,45 @@ class PolyEdgeBot:
 
         matches = self.match_cache.get("matches")
         if matches is None:
+            cycle_stats["status"] = "no_matches_cache"
+            self.last_fast_cycle = cycle_stats
             return
+        cycle_stats["matches_total"] = len(matches)
         agg_cache = self.odds_cache.get("aggregated") or {}
 
         if self.breaker.is_tripped():
+            cycle_stats["status"] = "blocked_circuit_breaker"
+            cycle_stats["blocked_circuit_breaker"] = 1
+            cycle_stats["trip_reason"] = str(self.breaker.trip_reason or "")
             logger.warning("Circuit breaker active: %s", self.breaker.trip_reason)
+            self.last_fast_cycle = cycle_stats
             return
 
         # Fetch bankroll once per cycle (not per opportunity).
         if self.cfg.simulation_mode:
             bankroll = self.simulator.current_bankroll
             if bankroll <= 0:
+                cycle_stats["status"] = "blocked_bankroll_zero"
+                cycle_stats["blocked_bankroll_zero"] = 1
                 logger.warning("Simulation bankroll is depleted — skipping fast cycle")
+                self.last_fast_cycle = cycle_stats
                 return
         elif self._is_live_mode():
             bankroll = self._get_bankroll()
             if bankroll is None:
+                cycle_stats["status"] = "blocked_bankroll_unavailable"
+                cycle_stats["blocked_bankroll_unavailable"] = 1
                 logger.warning("Bankroll unavailable — skipping fast cycle")
+                self.last_fast_cycle = cycle_stats
                 return
             self.live_wallet_balance_usd = float(bankroll)
             if self.live_wallet_start_usd is None:
                 self.live_wallet_start_usd = float(bankroll)
             if bankroll <= 0:
+                cycle_stats["status"] = "blocked_bankroll_zero"
+                cycle_stats["blocked_bankroll_zero"] = 1
                 logger.debug("Bankroll is $0 — no funds to trade")
+                self.last_fast_cycle = cycle_stats
                 return
         else:
             bankroll = DRY_RUN_BANKROLL_USD
@@ -504,12 +545,15 @@ class PolyEdgeBot:
             cid = matched.poly_market.condition_id
             agg = agg_cache.get(cid)
             if not agg:
+                cycle_stats["skipped_no_agg"] += 1
                 continue
+            cycle_stats["with_agg"] += 1
 
             try:
                 book_a = await fetch_order_book(matched.poly_market.token_id_a)
                 book_b = await fetch_order_book(matched.poly_market.token_id_b)
             except Exception as e:
+                cycle_stats["skipped_order_book_fetch"] += 1
                 logger.warning("Order book fetch failed for %s: %s", cid, e)
                 self.breaker.record_api_error()
                 continue
@@ -529,16 +573,24 @@ class PolyEdgeBot:
             # Never keep orders alive into live play.
             now_ts = datetime.now(timezone.utc).timestamp()
             if event_start_ts is not None and now_ts >= event_start_ts:
+                cycle_stats["skipped_event_started"] += 1
                 continue
             if event_start_ts is not None and close_before_event_sec > 0:
                 if now_ts >= event_start_ts - close_before_event_sec:
+                    cycle_stats["skipped_pre_event_window"] += 1
                     continue
 
             opportunities = detect_edge(matched, agg, book_a, book_b, self.cfg, hours_until)
+            if not opportunities:
+                cycle_stats["skipped_no_edge_or_gates"] += 1
+                continue
+            cycle_stats["opportunities"] += len(opportunities)
 
             for opp in opportunities:
                 locked_side = self.condition_side_lock.get(cid)
                 if locked_side and locked_side != opp.buy_outcome:
+                    cycle_stats["skipped_opposite_side_locked"] += 1
+                    cycle_stats["rejected"] += 1
                     audit_log.log_decision(
                         opp,
                         "REJECTED",
@@ -563,6 +615,7 @@ class PolyEdgeBot:
                     min_edge=self.cfg.min_edge,
                 )
                 if opp.bet_usd <= 0:
+                    cycle_stats["skipped_bet_too_small"] += 1
                     continue
                 opp.shares = int(opp.bet_usd / opp.poly_fill_price)
 
@@ -575,9 +628,11 @@ class PolyEdgeBot:
                     max_total=self.cfg.max_total_exposure_pct,
                     daily_loss_limit=self.cfg.daily_loss_limit_pct,
                 ):
+                    cycle_stats["skipped_exposure"] += 1
                     continue
 
                 if self.cfg.simulation_mode:
+                    cycle_stats["simulated"] += 1
                     sim = self.simulator.record_bet(opp, cycle=self.cycle)
                     self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
                     self.condition_side_lock[cid] = opp.buy_outcome
@@ -607,6 +662,7 @@ class PolyEdgeBot:
                         self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
                         self.condition_side_lock[cid] = opp.buy_outcome
                         self.trades_today += 1
+                        cycle_stats["submitted"] += 1
                         logger.info("ORDER SUBMITTED: %s %s edge=%.1f%% $%.2f @ %.4f",
                                     matched.poly_market.event_title,
                                     "YES" if opp.buy_outcome == "a" else "NO",
@@ -622,6 +678,7 @@ class PolyEdgeBot:
                         last_error = getattr(self.executor, "last_error", "")
                         if last_error:
                             reject_meta["reject_reason"] = last_error
+                        cycle_stats["rejected"] += 1
                         audit_log.log_decision(
                             opp,
                             "REJECTED",
@@ -629,9 +686,13 @@ class PolyEdgeBot:
                             meta=reject_meta or None,
                         )
                 else:
+                    cycle_stats["dry_run"] += 1
                     logger.info("DRY RUN — would trade: %s edge=%.1f%% $%.2f",
                                 matched.poly_market.event_title, opp.adjusted_edge * 100, opp.bet_usd)
                     audit_log.log_decision(opp, "DRY_RUN", cycle=self.cycle)
+
+        cycle_stats["status"] = "completed"
+        self.last_fast_cycle = cycle_stats
 
     async def run(self):
         """Main loop with fast/slow cycle separation."""
