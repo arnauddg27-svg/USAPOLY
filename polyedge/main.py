@@ -120,6 +120,8 @@ class PolyEdgeBot:
             "aggregated_by_market_type": {},
         }
         self.last_fast_cycle: dict[str, int | str] = {}
+        self._active_sig_type: int | None = None
+        self._active_funder: str | None = None
 
     def _is_live_mode(self) -> bool:
         return (
@@ -145,17 +147,20 @@ class PolyEdgeBot:
             from py_clob_client.client import ClobClient
             from py_clob_client.constants import POLYGON
 
+            sig_type = int(self.cfg.poly_signature_type)
             funder = self.cfg.poly_funder_address or None
             self.poly_client = ClobClient(
                 "https://clob.polymarket.com",
                 key=self.cfg.poly_private_key,
                 chain_id=POLYGON,
-                signature_type=self.cfg.poly_signature_type,
+                signature_type=sig_type,
                 funder=funder,
             )
             self.poly_client.set_api_creds(
                 self.poly_client.create_or_derive_api_creds()
             )
+            self._active_sig_type = sig_type
+            self._active_funder = funder
             self.executor = EdgeExecutor(self.poly_client)
             self.order_mgr = OrderManager(self.poly_client)
             holder = self.cfg.poly_funder_address or ""
@@ -173,13 +178,19 @@ class PolyEdgeBot:
                     logger.warning("Auto-claim disabled: %s", self.redeemer.disable_reason)
             else:
                 logger.info("Auto-claim disabled by config")
-            logger.info("CLOB client initialized (funder=%s)", funder)
+            logger.info(
+                "CLOB client initialized (sig_type=%s funder=%s)",
+                sig_type,
+                funder,
+            )
         except Exception as e:
             logger.error("CLOB client init failed: %s — continuing in dry-run mode", e)
             self.poly_client = None
             self.executor = None
             self.order_mgr = None
             self.redeemer = None
+            self._active_sig_type = None
+            self._active_funder = None
 
     def _write_health(self, status: str, last_error: str = "") -> None:
         """Persist lightweight bot health status for external checks."""
@@ -231,6 +242,8 @@ class PolyEdgeBot:
                 "aggregated_by_sport": self.coverage.get("aggregated_by_sport", {}),
                 "aggregated_by_market_type": self.coverage.get("aggregated_by_market_type", {}),
                 "last_fast_cycle": self.last_fast_cycle,
+                "active_sig_type": self._active_sig_type,
+                "active_funder": self._active_funder,
             }
             if exchange_open_orders_count is not None:
                 payload["exchange_open_orders_count"] = int(exchange_open_orders_count)
@@ -347,16 +360,127 @@ class PolyEdgeBot:
         """Get USDC balance from CLOB client. Returns None on failure."""
         if not self.poly_client:
             return None
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        def _parse_balance(resp) -> float:
+            if isinstance(resp, dict):
+                # py_clob_client returns integer micro-USDC in "balance".
+                # Keep a small fallback list to survive upstream schema changes.
+                for key in (
+                    "balance",
+                    "available",
+                    "available_balance",
+                    "availableBalance",
+                    "collateral_balance",
+                    "collateralBalance",
+                ):
+                    if key in resp:
+                        try:
+                            return float(resp.get(key, 0))
+                        except (TypeError, ValueError):
+                            continue
+                return 0.0
+            try:
+                return float(resp)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _fetch_balance(client, sig_type: int | None = None) -> float:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            if sig_type is not None:
+                params.signature_type = int(sig_type)
+            resp = client.get_balance_allowance(params)
+            return _parse_balance(resp) / 1_000_000.0
+
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            resp = self.poly_client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            raw = float(resp.get("balance", 0)) if isinstance(resp, dict) else float(resp)
-            return raw / 1_000_000.0  # USDC has 6 decimals on Polygon
+            bal = _fetch_balance(self.poly_client)
+            if bal > 0:
+                return bal
         except Exception as e:
             logger.error("Balance fetch failed: %s", e)
             return None
+
+        # Auto-recover when env signature/funder is wrong but key is valid:
+        # probe common identity combinations and switch the live client.
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.constants import POLYGON
+
+            cfg_funder = self.cfg.poly_funder_address or None
+            candidate_sig_types: list[int] = []
+            for candidate in (self.cfg.poly_signature_type, 2, 1, 0):
+                c = int(candidate)
+                if c not in candidate_sig_types:
+                    candidate_sig_types.append(c)
+
+            candidates: list[tuple[int, str | None]] = []
+            for sig_type in candidate_sig_types:
+                if sig_type in (1, 2):
+                    for funder in (cfg_funder, None):
+                        if (sig_type, funder) not in candidates:
+                            candidates.append((sig_type, funder))
+                else:
+                    for funder in (None, cfg_funder):
+                        if (sig_type, funder) not in candidates:
+                            candidates.append((sig_type, funder))
+
+            best: tuple[float, int | None, str | None, object | None] = (0.0, None, None, None)
+            for sig_type, funder in candidates:
+                try:
+                    probe = ClobClient(
+                        "https://clob.polymarket.com",
+                        key=self.cfg.poly_private_key,
+                        chain_id=POLYGON,
+                        signature_type=int(sig_type),
+                        funder=funder,
+                    )
+                    probe.set_api_creds(probe.create_or_derive_api_creds())
+                    probe_bal = _fetch_balance(probe, sig_type=sig_type)
+                    logger.info(
+                        "Bankroll probe sig_type=%s funder=%s balance=$%.2f",
+                        sig_type,
+                        funder,
+                        probe_bal,
+                    )
+                    if probe_bal > best[0]:
+                        best = (probe_bal, sig_type, funder, probe)
+                except Exception as probe_err:
+                    logger.info(
+                        "Bankroll probe failed sig_type=%s funder=%s: %s",
+                        sig_type,
+                        funder,
+                        probe_err,
+                    )
+
+            best_bal, best_sig, best_funder, best_client = best
+            if best_bal <= 0 or best_client is None:
+                return 0.0
+
+            current_sig = self._active_sig_type
+            current_funder = self._active_funder
+            if current_sig != best_sig or current_funder != best_funder:
+                self.poly_client = best_client
+                self.executor = EdgeExecutor(self.poly_client)
+                self.order_mgr = OrderManager(self.poly_client)
+                holder = best_funder or ""
+                self.redeemer = AutoRedeemer(
+                    private_key=self.cfg.poly_private_key,
+                    holder_address=holder,
+                    rpc_url=self.cfg.polygon_rpc,
+                    usdc_address=self.cfg.usdc_address,
+                    claim_cooldown_sec=self.cfg.claim_cooldown_sec,
+                )
+                self._active_sig_type = int(best_sig) if best_sig is not None else None
+                self._active_funder = best_funder
+                logger.warning(
+                    "Switched live identity to sig_type=%s funder=%s after zero bankroll probe",
+                    self._active_sig_type,
+                    self._active_funder,
+                )
+            return best_bal
+        except Exception as e:
+            logger.error("Bankroll probe failed: %s", e)
+            return 0.0
 
     async def _slow_cycle(self):
         """Refresh odds, markets, and matching (every ~2 min)."""

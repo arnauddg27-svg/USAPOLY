@@ -466,3 +466,69 @@ def test_fast_cycle_records_bankroll_blocker_for_live_mode(monkeypatch):
     stats = bot.last_fast_cycle
     assert stats["status"] == "blocked_bankroll_unavailable"
     assert stats["blocked_bankroll_unavailable"] == 1
+
+
+def test_get_bankroll_probes_and_switches_identity(monkeypatch):
+    fake_clob_types_mod = types.ModuleType("py_clob_client.clob_types")
+
+    class BalanceAllowanceParams:
+        def __init__(self, asset_type=None, token_id=None, signature_type=-1):
+            self.asset_type = asset_type
+            self.token_id = token_id
+            self.signature_type = signature_type
+
+    class AssetType:
+        COLLATERAL = "COLLATERAL"
+
+    fake_clob_types_mod.BalanceAllowanceParams = BalanceAllowanceParams
+    fake_clob_types_mod.AssetType = AssetType
+
+    fake_constants_mod = types.ModuleType("py_clob_client.constants")
+    fake_constants_mod.POLYGON = 137
+
+    class FakeClobClient:
+        def __init__(self, _host, key=None, chain_id=None, signature_type=None, funder=None):
+            self.key = key
+            self.chain_id = chain_id
+            self.builder = types.SimpleNamespace(sig_type=signature_type, funder=funder)
+
+        def set_api_creds(self, _creds):
+            return None
+
+        def create_or_derive_api_creds(self):
+            return {}
+
+        def get_balance_allowance(self, params):
+            sig = self.builder.sig_type if getattr(params, "signature_type", -1) == -1 else params.signature_type
+            funder = self.builder.funder
+            if sig == 2 and funder == "0xfund":
+                return {"balance": 250_000_000}
+            return {"balance": 0}
+
+    fake_client_mod = types.ModuleType("py_clob_client.client")
+    fake_client_mod.ClobClient = FakeClobClient
+
+    class DummyRedeemer:
+        def __init__(self, *args, **kwargs):
+            self.enabled = False
+            self.disable_reason = "test"
+            self.holder_address = kwargs.get("holder_address", "")
+
+    monkeypatch.setitem(sys.modules, "py_clob_client.clob_types", fake_clob_types_mod)
+    monkeypatch.setitem(sys.modules, "py_clob_client.constants", fake_constants_mod)
+    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
+    monkeypatch.setattr("polyedge.main.AutoRedeemer", DummyRedeemer)
+
+    bot = PolyEdgeBot()
+    bot.cfg.poly_private_key = "0xabc"
+    bot.cfg.poly_signature_type = 0
+    bot.cfg.poly_funder_address = "0xfund"
+    bot.poly_client = FakeClobClient("https://clob.polymarket.com", key="0xabc", chain_id=137, signature_type=0, funder=None)
+    bot._active_sig_type = 0
+    bot._active_funder = None
+
+    balance = bot._get_bankroll()
+
+    assert balance == pytest.approx(250.0)
+    assert bot._active_sig_type == 2
+    assert bot._active_funder == "0xfund"
