@@ -62,3 +62,13 @@ class TestSizing:
             book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
         )
         assert size <= 50.0
+
+    def test_total_exposure_hard_cap_stops_over_30_percent(self):
+        size = compute_bet_size(
+            adjusted_edge=0.40, fill_price=0.20, bankroll=1000,
+            fraction_kelly=1.0, max_per_event_pct=0.50,
+            total_exposure=290.0, max_total_pct=1.0, cash_buffer_pct=0.0,
+            book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+        )
+        # With a hard 30% total cap on $1,000 bankroll, only $10 headroom remains.
+        assert size <= 10.0

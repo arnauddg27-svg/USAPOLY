@@ -24,7 +24,7 @@ def compute_bet_size(
     # Hard safety ceilings prevent accidental oversized single bets.
     safe_event_pct = min(max(max_per_event_pct, 0.0), 0.05)
     safe_sport_pct = min(max(max_per_sport_pct, 0.0), 0.20)
-    safe_total_pct = min(max(max_total_pct, 0.0), 0.40)
+    safe_total_pct = min(max(max_total_pct, 0.0), 0.30)
 
     bet = min(bet, bankroll * safe_event_pct)
     bet = min(bet, bankroll * safe_sport_pct - sport_exposure)
