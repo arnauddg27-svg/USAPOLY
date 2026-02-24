@@ -10,7 +10,11 @@ from polyedge.data.polymarket import fetch_sports_markets, fetch_order_book
 from polyedge.data.cache import TTLCache
 from polyedge.pipeline.devig import devig
 from polyedge.pipeline.aggregator import aggregate_probs
-from polyedge.pipeline.matcher import match_events, orient_book_outcomes
+from polyedge.pipeline.matcher import (
+    match_events,
+    orient_book_outcomes,
+    spread_points_compatible,
+)
 from polyedge.pipeline.edge_detector import detect_edge
 from polyedge.execution.sizing import compute_bet_size
 from polyedge.execution.executor import EdgeExecutor
@@ -398,6 +402,13 @@ class PolyEdgeBot:
                     if oriented is None:
                         continue
                     team_a_outcome, team_b_outcome = oriented
+                    if market_type == "spread":
+                        if not spread_points_compatible(
+                            m.poly_market,
+                            team_a_outcome,
+                            team_b_outcome,
+                        ):
+                            continue
                     p_a, p_b = devig(
                         team_a_outcome.decimal_odds,
                         team_b_outcome.decimal_odds,
@@ -549,6 +560,7 @@ class PolyEdgeBot:
                     min_bet=self.cfg.min_bet_usd,
                     sport_exposure=self.exposure.sport_exposure(opp.matched_event.sport),
                     max_per_sport_pct=self.cfg.max_per_sport_pct,
+                    min_edge=self.cfg.min_edge,
                 )
                 if opp.bet_usd <= 0:
                     continue

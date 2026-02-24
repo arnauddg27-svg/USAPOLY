@@ -78,6 +78,7 @@ TEAM_ALIASES: dict[str, list[str]] = {
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_SPREAD_POINT_RE = re.compile(r"\(\s*([+-]?\d+(?:\.\d+)?)\s*\)\s*$")
 # Gamma sports event timestamps are often stale by up to ~2 weeks.
 # Keep a broad guard to block clearly unrelated historical markets,
 # while still allowing current matchup markets with imperfect metadata.
@@ -163,6 +164,65 @@ def orient_book_outcomes(
     if a_second and b_first:
         return second, first
     return None
+
+
+def _extract_spread_point(text: str) -> float | None:
+    m = _SPREAD_POINT_RE.search(str(text or "").strip())
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_named_point(question: str, team_name: str) -> float | None:
+    team = str(team_name or "").strip()
+    q = str(question or "")
+    if not team or not q:
+        return None
+    pattern = re.compile(rf"{re.escape(team)}\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*\)", re.IGNORECASE)
+    m = pattern.search(q)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def poly_spread_points(poly: PolyMarket) -> tuple[float | None, float | None]:
+    """Return expected spread points for (outcome_a, outcome_b), if derivable."""
+    point_a = _extract_spread_point(poly.outcome_a)
+    point_b = _extract_spread_point(poly.outcome_b)
+
+    if point_a is None:
+        point_a = _extract_named_point(poly.question, poly.outcome_a)
+    if point_b is None:
+        point_b = _extract_named_point(poly.question, poly.outcome_b)
+
+    if point_a is None and point_b is not None:
+        point_a = -point_b
+    elif point_b is None and point_a is not None:
+        point_b = -point_a
+    return point_a, point_b
+
+
+def spread_points_compatible(
+    poly: PolyMarket,
+    team_a_outcome: SportsOutcome,
+    team_b_outcome: SportsOutcome,
+    tol: float = 0.01,
+) -> bool:
+    """Ensure sportsbook spread line exactly matches the Polymarket spread line."""
+    expected_a, expected_b = poly_spread_points(poly)
+    if expected_a is None or expected_b is None:
+        return False
+    book_a = _extract_spread_point(team_a_outcome.name)
+    book_b = _extract_spread_point(team_b_outcome.name)
+    if book_a is None or book_b is None:
+        return False
+    return abs(book_a - expected_a) <= tol and abs(book_b - expected_b) <= tol
 
 
 def match_events(

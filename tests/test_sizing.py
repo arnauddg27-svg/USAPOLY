@@ -38,3 +38,27 @@ class TestSizing:
             book_depth_usd=20, min_bet=5.0,
         )
         assert size <= 16.0
+
+    def test_higher_edge_produces_larger_size(self):
+        low = compute_bet_size(
+            adjusted_edge=0.04, fill_price=0.50, bankroll=1000,
+            fraction_kelly=0.15, max_per_event_pct=0.05,
+            total_exposure=0, max_total_pct=0.30, cash_buffer_pct=0.20,
+            book_depth_usd=1000, min_bet=1.0, min_edge=0.03,
+        )
+        high = compute_bet_size(
+            adjusted_edge=0.12, fill_price=0.50, bankroll=1000,
+            fraction_kelly=0.15, max_per_event_pct=0.05,
+            total_exposure=0, max_total_pct=0.30, cash_buffer_pct=0.20,
+            book_depth_usd=1000, min_bet=1.0, min_edge=0.03,
+        )
+        assert high > low
+
+    def test_event_pct_hard_cap_prevents_oversized_bet(self):
+        size = compute_bet_size(
+            adjusted_edge=0.40, fill_price=0.20, bankroll=1000,
+            fraction_kelly=1.0, max_per_event_pct=0.50,
+            total_exposure=0, max_total_pct=1.0, cash_buffer_pct=0.0,
+            book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+        )
+        assert size <= 50.0

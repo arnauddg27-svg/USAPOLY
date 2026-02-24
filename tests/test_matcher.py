@@ -1,7 +1,12 @@
 import pytest
 
 from polyedge.models import AllBookOdds, PolyMarket, SportsOutcome
-from polyedge.pipeline.matcher import match_events, orient_book_outcomes
+from polyedge.pipeline.matcher import (
+    match_events,
+    orient_book_outcomes,
+    poly_spread_points,
+    spread_points_compatible,
+)
 
 def _game(home="Boston Celtics", away="Los Angeles Lakers", sport="basketball_nba", commence_time="2026-02-21T00:00:00Z"):
     return AllBookOdds(sport=sport, home=home, away=away, commence_time=commence_time,
@@ -71,3 +76,46 @@ class TestMatching:
         a, b = oriented
         assert a.name == "Boston Celtics"
         assert b.name == "Los Angeles Lakers"
+
+    def test_poly_spread_points_inferred_from_question(self):
+        poly = PolyMarket(
+            event_title="KRC Genk vs Dinamo Zagreb",
+            condition_id="cond-spread",
+            outcome_a="KRC Genk",
+            outcome_b="Dinamo Zagreb",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="Spread: KRC Genk (-1.5)",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        point_a, point_b = poly_spread_points(poly)
+        assert point_a == -1.5
+        assert point_b == 1.5
+
+    def test_spread_points_compatible_requires_exact_line(self):
+        poly = PolyMarket(
+            event_title="KRC Genk vs Dinamo Zagreb",
+            condition_id="cond-spread",
+            outcome_a="KRC Genk",
+            outcome_b="Dinamo Zagreb",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="Spread: KRC Genk (-1.5)",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        ok = spread_points_compatible(
+            poly,
+            SportsOutcome("KRC Genk (-1.5)", -110, "DK"),
+            SportsOutcome("Dinamo Zagreb (+1.5)", -110, "DK"),
+        )
+        bad = spread_points_compatible(
+            poly,
+            SportsOutcome("KRC Genk (+1.5)", -110, "DK"),
+            SportsOutcome("Dinamo Zagreb (-1.5)", -110, "DK"),
+        )
+        assert ok is True
+        assert bad is False
