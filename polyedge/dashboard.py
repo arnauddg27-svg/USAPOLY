@@ -540,14 +540,14 @@ def inject_theme():
         }
         .stButton > button {
           border-radius: 10px;
-          border: 1px solid #0f172a;
-          background: #0f172a;
+          border: 1px solid #0369a1;
+          background: #0369a1;
           color: #ffffff;
           font-weight: 600;
         }
         .stButton > button:hover {
-          border-color: #111827;
-          background: #111827;
+          border-color: #075985;
+          background: #075985;
           color: #ffffff;
         }
         .stButton > button:disabled {
@@ -559,6 +559,25 @@ def inject_theme():
         .stSlider > div > div {
           border-radius: 10px;
         }
+        div[data-baseweb="select"] > div {
+          background: #ffffff !important;
+          border: 1px solid var(--line) !important;
+          color: var(--ink) !important;
+        }
+        div[data-baseweb="select"] span,
+        div[data-baseweb="select"] input,
+        div[data-baseweb="select"] svg {
+          color: var(--ink) !important;
+          fill: var(--ink) !important;
+        }
+        div[data-baseweb="popover"] div[data-baseweb="menu"] {
+          background: #ffffff !important;
+          border: 1px solid var(--line) !important;
+          color: var(--ink) !important;
+        }
+        div[data-baseweb="popover"] div[data-baseweb="menu"] * {
+          color: var(--ink) !important;
+        }
         [data-testid="stMarkdownContainer"],
         [data-testid="stCaptionContainer"] {
           color: var(--ink);
@@ -567,6 +586,9 @@ def inject_theme():
           border: 1px solid var(--line);
           border-radius: 12px;
           background: #ffffff;
+        }
+        [data-testid="stDataFrame"] * {
+          color: var(--ink) !important;
         }
         [data-testid="stVegaLiteChart"] {
           border: 1px solid var(--line);
