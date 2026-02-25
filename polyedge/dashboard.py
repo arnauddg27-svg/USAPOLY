@@ -114,6 +114,74 @@ def _window_df(df: pd.DataFrame, hours: int) -> pd.DataFrame:
     return df[df["timestamp"] >= cutoff].copy()
 
 
+def _parse_activity_timestamp(row: dict) -> datetime | None:
+    for key in ("timestamp", "createdAt", "created_at", "blockTimestamp"):
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                if ts > 1e12:
+                    ts /= 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    continue
+                maybe_num = _to_float_or_none(text)
+                if maybe_num is not None:
+                    ts = float(maybe_num)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    return datetime.fromtimestamp(ts, tz=timezone.utc)
+                ts = pd.to_datetime(text, utc=True, errors="coerce")
+                if pd.notna(ts):
+                    return ts.to_pydatetime()
+        except Exception:
+            continue
+    return None
+
+
+def _extract_activity_usd(row: dict) -> float:
+    for key in ("usdcSize", "usdc_size", "amount_usdc", "amountUsd", "value"):
+        val = _to_float_or_none(row.get(key))
+        if val is not None and val >= 0:
+            return float(val)
+
+    size = _to_float_or_none(row.get("size"))
+    if size is None:
+        size = _to_float_or_none(row.get("shares"))
+    price = _to_float_or_none(row.get("price"))
+    if price is None:
+        price = _to_float_or_none(row.get("outcomePrice"))
+    if size is not None and price is not None and size >= 0 and price >= 0:
+        return float(size * price)
+
+    amount = _to_float_or_none(row.get("amount"))
+    if amount is not None and amount >= 0:
+        return float(amount)
+    return 0.0
+
+
+def _extract_activity_sport(row: dict) -> str:
+    for key in ("sport", "sport_key", "sportKey"):
+        val = str(row.get(key) or "").strip().lower()
+        if val:
+            return val
+    return ""
+
+
+def _sum_by_sport_token(values_by_sport: dict[str, int | float], token: str) -> int:
+    total = 0.0
+    for sport_key, value in values_by_sport.items():
+        if _sport_matches_token(str(sport_key), token):
+            v = _to_float_or_none(value)
+            if v is not None:
+                total += float(v)
+    return int(round(total))
+
+
 def _sport_prefix_for_token(token: str) -> str | None:
     t = str(token or "").strip().lower()
     if t.endswith("_all"):
@@ -378,6 +446,108 @@ def load_unsettled_value(user_address: str) -> dict:
         "address": address,
         "rows": len(values),
         "unsettled_value_usd": round(total, 2),
+    }
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def load_exchange_activity_summary(
+    user_address: str,
+    session_start_epoch: float | None = None,
+    lookback_hours: int = 24,
+    limit: int = 200,
+    max_pages: int = 3,
+) -> dict:
+    """Fetch recent exchange activity (fills) for the wallet."""
+    address = (user_address or "").strip()
+    if not address:
+        return {"fetched": False, "error": "missing_address"}
+
+    safe_limit = max(1, min(int(limit), 500))
+    safe_pages = max(1, min(int(max_pages), 20))
+    offset = 0
+    rows: list[dict] = []
+    seen_ids: set[str] = set()
+    base_url = "https://data-api.polymarket.com/activity"
+
+    for _ in range(safe_pages):
+        query = urllib.parse.urlencode({"user": address, "limit": safe_limit, "offset": offset})
+        req = urllib.request.Request(
+            f"{base_url}?{query}",
+            headers={"User-Agent": "PolyEdge-Dashboard/1.0"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    return {"fetched": False, "error": f"http_{resp.status}"}
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return {"fetched": False, "error": str(exc)}
+
+        if not isinstance(payload, list) or not payload:
+            break
+
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            row_id = str(raw.get("id") or raw.get("transactionHash") or "")
+            if row_id:
+                if row_id in seen_ids:
+                    continue
+                seen_ids.add(row_id)
+            rows.append(raw)
+
+        if len(payload) < safe_limit:
+            break
+        offset += safe_limit
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = now_utc - pd.Timedelta(hours=max(1, int(lookback_hours)))
+    session_cutoff = None
+    if session_start_epoch is not None:
+        try:
+            session_cutoff = datetime.fromtimestamp(float(session_start_epoch), tz=timezone.utc)
+        except Exception:
+            session_cutoff = None
+
+    fills_24h = 0
+    fills_session = 0
+    fill_volume_usd_24h = 0.0
+    fill_volume_usd_session = 0.0
+    fills_by_sport_24h: dict[str, int] = {}
+    fills_by_sport_session: dict[str, int] = {}
+
+    for row in rows:
+        side = str(row.get("side") or row.get("type") or "").strip().upper()
+        if side not in {"BUY", "SELL", "MARKET_BUY", "MARKET_SELL"}:
+            continue
+        ts = _parse_activity_timestamp(row)
+        if ts is None:
+            continue
+        amt_usd = _extract_activity_usd(row)
+        sport = _extract_activity_sport(row)
+
+        if ts >= cutoff_24h:
+            fills_24h += 1
+            fill_volume_usd_24h += amt_usd
+            if sport:
+                fills_by_sport_24h[sport] = fills_by_sport_24h.get(sport, 0) + 1
+        if session_cutoff is None or ts >= session_cutoff:
+            fills_session += 1
+            fill_volume_usd_session += amt_usd
+            if sport:
+                fills_by_sport_session[sport] = fills_by_sport_session.get(sport, 0) + 1
+
+    return {
+        "fetched": True,
+        "address": address,
+        "rows_scanned": len(rows),
+        "fills_24h": int(fills_24h),
+        "fills_session": int(fills_session),
+        "fill_volume_usd_24h": round(fill_volume_usd_24h, 2),
+        "fill_volume_usd_session": round(fill_volume_usd_session, 2),
+        "fills_by_sport_24h": fills_by_sport_24h,
+        "fills_by_sport_session": fills_by_sport_session,
     }
 
 
@@ -887,12 +1057,54 @@ with tab_overview:
         if live_pnl_usd is not None and wallet_start_usd not in (None, 0.0)
         else None
     )
+    fills_summary = {"fetched": False, "error": "simulation_or_missing_address"}
+    fills_24h = 0
+    fills_session = 0
+    fill_volume_usd_24h = 0.0
+    fill_volume_usd_session = 0.0
+    fills_by_sport_24h: dict[str, int] = {}
+    fills_by_sport_session: dict[str, int] = {}
+    if not sim_mode and portfolio_address:
+        session_start_epoch = (
+            float(session_start.timestamp())
+            if pd.notna(session_start)
+            else None
+        )
+        fills_summary = load_exchange_activity_summary(
+            portfolio_address,
+            session_start_epoch=session_start_epoch,
+            lookback_hours=24,
+            limit=200,
+            max_pages=3,
+        )
+        if fills_summary.get("fetched"):
+            fills_24h = int(fills_summary.get("fills_24h") or 0)
+            fills_session = int(fills_summary.get("fills_session") or 0)
+            fill_volume_usd_24h = float(fills_summary.get("fill_volume_usd_24h") or 0.0)
+            fill_volume_usd_session = float(fills_summary.get("fill_volume_usd_session") or 0.0)
+            fills_by_sport_24h = (
+                fills_summary.get("fills_by_sport_24h")
+                if isinstance(fills_summary.get("fills_by_sport_24h"), dict)
+                else {}
+            )
+            fills_by_sport_session = (
+                fills_summary.get("fills_by_sport_session")
+                if isinstance(fills_summary.get("fills_by_sport_session"), dict)
+                else {}
+            )
+
+    if sport_activity_rows:
+        for row in sport_activity_rows:
+            sport_name = str(row.get("sport") or "")
+            row["fills_session"] = _sum_by_sport_token(fills_by_sport_session, sport_name)
+            row["fills_24h"] = _sum_by_sport_token(fills_by_sport_24h, sport_name)
 
     if sim_mode and dry_run_7d > 0:
         st.caption("`DRY_RUN` rows are signal checks only and are not submitted orders.")
     st.caption("Live cards are bot-scoped: bot-submitted orders and bot-tracked USDC cash, not full Polymarket portfolio P&L.")
     if not sim_mode:
         st.caption("Total equity = bot cash + current value of active open positions.")
+        st.caption("`Submitted` = bot decision time; `Exchange fills` = actual fill events (can happen later).")
         if pd.notna(session_start):
             st.caption(f"Session start: {session_start.strftime('%m-%d %H:%M:%S UTC')}")
 
@@ -914,11 +1126,18 @@ with tab_overview:
             )
         else:
             top_d.metric("Sports Traded (Session)", str(sports_traded_session), f"24h: {sports_traded_24h}")
+        fill_a, fill_b = st.columns(2)
+        fill_a.metric("Exchange Fills (Session)", fills_session, f"24h: {fills_24h}")
+        fill_b.metric(
+            "Exchange Fill Volume (Session)",
+            _fmt_usd(fill_volume_usd_session),
+            f"24h: {_fmt_usd(fill_volume_usd_24h)}",
+        )
 
     if not sim_mode and sport_activity_rows:
         activity_df = pd.DataFrame(sport_activity_rows).sort_values(
-            ["submitted_24h", "decisions_24h", "sport"],
-            ascending=[False, False, True],
+            ["fills_24h", "submitted_24h", "decisions_24h", "sport"],
+            ascending=[False, False, False, True],
         )
         with st.expander("Sport Activity (24h + Session)", expanded=True):
             st.dataframe(activity_df, use_container_width=True, hide_index=True)
