@@ -114,6 +114,36 @@ def _window_df(df: pd.DataFrame, hours: int) -> pd.DataFrame:
     return df[df["timestamp"] >= cutoff].copy()
 
 
+def _sport_prefix_for_token(token: str) -> str | None:
+    t = str(token or "").strip().lower()
+    if t.endswith("_all"):
+        # soccer_all -> soccer_, tennis_all -> tennis_
+        return t[:-3]
+    if t.endswith("_*"):
+        return t[:-1]
+    return None
+
+
+def _sport_matches_token(sport_value: str, token: str) -> bool:
+    sport = str(sport_value or "").strip().lower()
+    if not sport:
+        return False
+    token_norm = str(token or "").strip().lower()
+    if not token_norm:
+        return False
+    prefix = _sport_prefix_for_token(token_norm)
+    if prefix is not None:
+        return sport.startswith(prefix)
+    return sport == token_norm
+
+
+def _sport_slice(df: pd.DataFrame, token: str) -> pd.DataFrame:
+    if df.empty or "sport" not in df.columns:
+        return df.iloc[0:0].copy()
+    mask = df["sport"].astype(str).apply(lambda s: _sport_matches_token(s, token))
+    return df[mask].copy()
+
+
 def _edge_breakdown_text(row: pd.Series) -> str:
     true_prob = _to_float_or_none(row.get("true_prob"))
     fill_prob = _to_float_or_none(row.get("poly_fill"))
@@ -746,12 +776,13 @@ with tab_overview:
     sport_activity_rows: list[dict] = []
     sports_traded_24h = 0
     sports_traded_session = 0
-    if "sport" in session_df.columns:
-        session_sports = session_df["sport"].dropna().astype(str).tolist()
-        all_sports = sorted(set(configured_sports) | set(session_sports))
+    if "sport" in recent_df.columns or "sport" in session_df.columns:
+        session_sports = session_df["sport"].dropna().astype(str).tolist() if "sport" in session_df.columns else []
+        recent_sports = recent_df["sport"].dropna().astype(str).tolist() if "sport" in recent_df.columns else []
+        all_sports = configured_sports or sorted(set(session_sports) | set(recent_sports))
         for sport_name in all_sports:
-            sport_24h_df = recent_df[recent_df["sport"] == sport_name].copy()
-            sport_df = session_df[session_df["sport"] == sport_name].copy()
+            sport_24h_df = _sport_slice(recent_df, sport_name)
+            sport_df = _sport_slice(session_df, sport_name)
             decisions_24h = len(sport_24h_df)
             decisions_session = len(sport_df)
             submitted_sport_24h = int(_has_actions(sport_24h_df, ORDER_ACTIONS).sum())
