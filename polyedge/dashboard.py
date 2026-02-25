@@ -1092,6 +1092,7 @@ with tab_overview:
                 if isinstance(fills_summary.get("fills_by_sport_session"), dict)
                 else {}
             )
+    fills_available = bool(fills_summary.get("fetched"))
 
     if sport_activity_rows:
         for row in sport_activity_rows:
@@ -1105,6 +1106,8 @@ with tab_overview:
     if not sim_mode:
         st.caption("Total equity = bot cash + current value of active open positions.")
         st.caption("`Submitted` = bot decision time; `Exchange fills` = actual fill events (can happen later).")
+        if not fills_available and portfolio_address:
+            st.caption(f"Exchange fills feed unavailable: {fills_summary.get('error', 'unknown_error')}")
         if pd.notna(session_start):
             st.caption(f"Session start: {session_start.strftime('%m-%d %H:%M:%S UTC')}")
 
@@ -1127,11 +1130,15 @@ with tab_overview:
         else:
             top_d.metric("Sports Traded (Session)", str(sports_traded_session), f"24h: {sports_traded_24h}")
         fill_a, fill_b = st.columns(2)
-        fill_a.metric("Exchange Fills (Session)", fills_session, f"24h: {fills_24h}")
+        fills_session_display = fills_session if fills_available else "—"
+        fills_24h_delta = f"24h: {fills_24h}" if fills_available else "24h: —"
+        fill_volume_session_display = _fmt_usd(fill_volume_usd_session) if fills_available else "—"
+        fill_volume_24h_delta = f"24h: {_fmt_usd(fill_volume_usd_24h)}" if fills_available else "24h: —"
+        fill_a.metric("Exchange Fills (Session)", fills_session_display, fills_24h_delta)
         fill_b.metric(
             "Exchange Fill Volume (Session)",
-            _fmt_usd(fill_volume_usd_session),
-            f"24h: {_fmt_usd(fill_volume_usd_24h)}",
+            fill_volume_session_display,
+            fill_volume_24h_delta,
         )
 
     if not sim_mode and sport_activity_rows:
