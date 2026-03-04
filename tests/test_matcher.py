@@ -33,6 +33,61 @@ class TestMatching:
         matches = match_events([_game()], [_poly("Celtics", "Lakers")])
         assert len(matches) == 1
 
+    def test_nhl_code_alias_match(self):
+        game = _game(
+            home="Philadelphia Flyers",
+            away="Washington Capitals",
+            sport="icehockey_nhl",
+            commence_time="2026-02-26T00:00:00Z",
+        )
+        poly = _poly(
+            outcome_a="PHI",
+            outcome_b="WSH",
+            title="Flyers vs Capitals",
+            start_iso="2026-02-26T01:00:00Z",
+        )
+        poly.sport_tag = "nhl"
+        matches = match_events([game], [poly])
+        assert len(matches) == 1
+        assert matches[0].team_a == "Philadelphia Flyers"
+        assert matches[0].team_b == "Washington Capitals"
+
+    def test_nhl_variant_name_matches_code_alias(self):
+        game = _game(
+            home="N.Y. Islanders",
+            away="Washington Capitals",
+            sport="icehockey_nhl",
+            commence_time="2026-02-26T00:00:00Z",
+        )
+        poly = _poly(
+            outcome_a="NYI",
+            outcome_b="WSH",
+            title="Islanders vs Capitals",
+            start_iso="2026-02-26T01:00:00Z",
+        )
+        poly.sport_tag = "nhl"
+        matches = match_events([game], [poly])
+        assert len(matches) == 1
+        assert matches[0].team_a == "N.Y. Islanders"
+        assert matches[0].team_b == "Washington Capitals"
+
+    def test_nhl_los_angeles_kings_alias_match(self):
+        game = _game(
+            home="Los Angeles Kings",
+            away="Anaheim Ducks",
+            sport="icehockey_nhl",
+            commence_time="2026-02-26T00:00:00Z",
+        )
+        poly = _poly(
+            outcome_a="LA Kings",
+            outcome_b="Ducks",
+            title="Kings vs Ducks",
+            start_iso="2026-02-26T01:00:00Z",
+        )
+        poly.sport_tag = "nhl"
+        matches = match_events([game], [poly])
+        assert len(matches) == 1
+
     def test_no_match(self):
         matches = match_events([_game()], [_poly("Miami Heat", "Chicago Bulls")])
         assert len(matches) == 0
@@ -41,6 +96,23 @@ class TestMatching:
         poly = _poly("Yes", "No", "Will Lakers beat Celtics?")
         matches = match_events([_game()], [poly])
         assert len(matches) == 0
+
+    def test_title_team_name_fallback_when_outcomes_are_generic(self):
+        game = _game(
+            home="Philadelphia Flyers",
+            away="Washington Capitals",
+            sport="icehockey_nhl",
+            commence_time="2026-02-26T00:00:00Z",
+        )
+        poly = _poly(
+            outcome_a="Home",
+            outcome_b="Away",
+            title="Flyers vs Capitals",
+            start_iso="2026-02-26T01:00:00Z",
+        )
+        poly.sport_tag = "nhl"
+        matches = match_events([game], [poly])
+        assert len(matches) == 1
 
     def test_token_boundary_prevents_false_alias_match(self):
         game = _game(home="Sacramento Kings", away="Chicago Bulls")
@@ -56,9 +128,27 @@ class TestMatching:
 
     def test_start_time_guard_allows_mid_range_drift(self):
         game = _game(commence_time="2026-02-21T00:00:00Z")
-        poly = _poly(start_iso="2026-02-26T00:00:00Z")
+        poly = _poly(start_iso="2026-02-21T06:00:00Z")
         matches = match_events([game], [poly])
         assert len(matches) == 1
+
+    def test_start_time_guard_blocks_31h_drift(self):
+        game = _game(commence_time="2026-02-21T00:00:00Z")
+        poly = _poly(start_iso="2026-02-22T07:00:00Z")
+        matches = match_events([game], [poly])
+        assert len(matches) == 0
+
+    def test_cross_date_guard_blocks_large_cross_day_drift(self):
+        game = _game(commence_time="2026-02-21T23:30:00Z")
+        poly = _poly(start_iso="2026-02-22T20:00:00Z")
+        matches = match_events([game], [poly])
+        assert len(matches) == 0
+
+    def test_start_time_guard_blocks_multi_day_drift(self):
+        game = _game(commence_time="2026-02-21T00:00:00Z")
+        poly = _poly(start_iso="2026-02-24T00:00:00Z")
+        matches = match_events([game], [poly])
+        assert len(matches) == 0
 
     def test_selects_closest_start_time_when_multiple_markets_match(self):
         game = _game(commence_time="2026-02-21T00:00:00Z")
@@ -67,6 +157,26 @@ class TestMatching:
         matches = match_events([game], [far, close])
         assert len(matches) == 1
         assert matches[0].poly_market.event_title == "Close"
+
+    def test_skips_ambiguous_missing_start_times(self):
+        game = _game(commence_time="2026-02-21T00:00:00Z")
+        p1 = _poly(start_iso="", title="A")
+        p2 = _poly(start_iso="", title="B")
+        p2.condition_id = "cond2"
+        matches = match_events([game], [p1, p2])
+        assert len(matches) == 0
+
+    def test_prefers_moneyline_over_spread_without_spread_books(self):
+        game = _game(commence_time="2026-02-21T00:00:00Z")
+        spread = _poly(start_iso="2026-02-21T01:00:00Z", title="Spread")
+        spread.condition_id = "cond_spread"
+        spread.market_type = "spread"
+        moneyline = _poly(start_iso="2026-02-21T01:00:00Z", title="Moneyline")
+        moneyline.condition_id = "cond_moneyline"
+        moneyline.market_type = "moneyline"
+        matches = match_events([game], [spread, moneyline])
+        assert len(matches) == 1
+        assert matches[0].poly_market.condition_id == "cond_moneyline"
 
     def test_orient_book_outcomes_handles_reversed_book_order(self):
         first = SportsOutcome("Los Angeles Lakers", 170, "DK")
@@ -119,3 +229,37 @@ class TestMatching:
         )
         assert ok is True
         assert bad is False
+
+    def test_poly_spread_points_supports_trailing_signed_values(self):
+        poly = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-spread-trailing",
+            outcome_a="Tottenham Hotspur -1.5",
+            outcome_b="Crystal Palace +1.5",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        point_a, point_b = poly_spread_points(poly)
+        assert point_a == -1.5
+        assert point_b == 1.5
+
+    def test_poly_spread_points_supports_named_question_without_parentheses(self):
+        poly = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-spread-question",
+            outcome_a="Tottenham Hotspur",
+            outcome_b="Crystal Palace",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="Spread: Tottenham Hotspur -1.5",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        point_a, point_b = poly_spread_points(poly)
+        assert point_a == -1.5
+        assert point_b == 1.5

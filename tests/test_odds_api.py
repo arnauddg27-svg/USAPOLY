@@ -47,6 +47,126 @@ SPREAD_ONLY_RESPONSE = [
     }
 ]
 
+SOCCER_THREE_WAY_RESPONSE = [
+    {
+        "sport_key": "soccer_epl",
+        "home_team": "Arsenal",
+        "away_team": "Chelsea",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_a",
+                "title": "BookA",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Arsenal", "price": 120},
+                    {"name": "Draw", "price": 240},
+                    {"name": "Chelsea", "price": 210},
+                ]}],
+            }
+        ],
+    }
+]
+
+SOCCER_THREE_WAY_MISMATCH_RESPONSE = [
+    {
+        "sport_key": "soccer_epl",
+        "home_team": "Arsenal",
+        "away_team": "Chelsea",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_a",
+                "title": "BookA",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Team A", "price": 120},
+                    {"name": "Draw", "price": 240},
+                    {"name": "Team B", "price": 210},
+                ]}],
+            }
+        ],
+    }
+]
+
+SOCCER_THREE_WAY_ABBREV_RESPONSE = [
+    {
+        "sport_key": "soccer_ligue_one",
+        "home_team": "Paris Saint Germain",
+        "away_team": "Olympique Marseille",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_abbrev",
+                "title": "BookAbbrev",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "PSG", "price": -120},
+                    {"name": "Draw", "price": 260},
+                    {"name": "Marseille", "price": 310},
+                ]}],
+            }
+        ],
+    }
+]
+
+SOCCER_THREE_WAY_MAN_UTD_RESPONSE = [
+    {
+        "sport_key": "soccer_epl",
+        "home_team": "Manchester United",
+        "away_team": "Liverpool",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_mu",
+                "title": "BookMU",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Man Utd", "price": 145},
+                    {"name": "Draw", "price": 250},
+                    {"name": "Liverpool", "price": 180},
+                ]}],
+            }
+        ],
+    }
+]
+
+SOCCER_THREE_WAY_MUNCHEN_RESPONSE = [
+    {
+        "sport_key": "soccer_germany_bundesliga",
+        "home_team": "Bayern Munich",
+        "away_team": "Borussia Dortmund",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_de",
+                "title": "BookDE",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Bayern Munchen", "price": -140},
+                    {"name": "Draw", "price": 280},
+                    {"name": "Dortmund", "price": 360},
+                ]}],
+            }
+        ],
+    }
+]
+
+SOCCER_THREE_WAY_LISBON_RESPONSE = [
+    {
+        "sport_key": "soccer_portugal_primeira_liga",
+        "home_team": "Sporting CP",
+        "away_team": "Porto",
+        "commence_time": "2026-02-21T00:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_pt",
+                "title": "BookPT",
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Sporting Lisbon", "price": -110},
+                    {"name": "Draw", "price": 240},
+                    {"name": "Porto", "price": 290},
+                ]}],
+            }
+        ],
+    }
+]
+
 
 class TestParseAllBooks:
     def test_parses_multiple_books(self):
@@ -112,6 +232,52 @@ class TestParseAllBooks:
         }]
         result = parse_all_books_response(data)
         assert result == []
+
+    def test_parses_soccer_three_way_h2h_as_two_way(self):
+        game = parse_all_books_response(SOCCER_THREE_WAY_RESPONSE)[0]
+        assert "BookA" in game.books
+        out_a, out_b = game.books["BookA"]
+        assert out_a.name == "Arsenal"
+        assert out_b.name == "Chelsea"
+        assert out_a.american_odds == 120
+        assert out_b.american_odds == 210
+
+    def test_skips_three_way_when_teams_do_not_match(self):
+        result = parse_all_books_response(SOCCER_THREE_WAY_MISMATCH_RESPONSE)
+        assert result == []
+
+    def test_parses_three_way_soccer_with_common_abbreviation(self):
+        game = parse_all_books_response(SOCCER_THREE_WAY_ABBREV_RESPONSE)[0]
+        assert "BookAbbrev" in game.books
+        out_a, out_b = game.books["BookAbbrev"]
+        assert out_a.name == "Paris Saint Germain"
+        assert out_b.name == "Olympique Marseille"
+        assert out_a.american_odds == -120
+        assert out_b.american_odds == 310
+
+    def test_parses_three_way_soccer_with_man_utd_abbreviation(self):
+        game = parse_all_books_response(SOCCER_THREE_WAY_MAN_UTD_RESPONSE)[0]
+        out_a, out_b = game.books["BookMU"]
+        assert out_a.name == "Manchester United"
+        assert out_b.name == "Liverpool"
+        assert out_a.american_odds == 145
+        assert out_b.american_odds == 180
+
+    def test_parses_three_way_soccer_with_munchen_transliteration(self):
+        game = parse_all_books_response(SOCCER_THREE_WAY_MUNCHEN_RESPONSE)[0]
+        out_a, out_b = game.books["BookDE"]
+        assert out_a.name == "Bayern Munich"
+        assert out_b.name == "Borussia Dortmund"
+        assert out_a.american_odds == -140
+        assert out_b.american_odds == 360
+
+    def test_parses_three_way_soccer_with_lisbon_alias(self):
+        game = parse_all_books_response(SOCCER_THREE_WAY_LISBON_RESPONSE)[0]
+        out_a, out_b = game.books["BookPT"]
+        assert out_a.name == "Sporting CP"
+        assert out_b.name == "Porto"
+        assert out_a.american_odds == -110
+        assert out_b.american_odds == 290
 
 
 class TestSportExpansion:

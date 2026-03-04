@@ -6,6 +6,8 @@ per-book devigging and cross-book aggregation.
 """
 
 import logging
+import re
+import unicodedata
 
 import aiohttp
 
@@ -20,6 +22,21 @@ _SPORT_WILDCARDS = {
     "tennis_all": "tennis_",
     "tennis_*": "tennis_",
 }
+_NAME_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TEAM_NOISE_TOKENS = {"fc", "cf", "sc", "ac", "afc", "club", "w", "women", "de", "la"}
+_TEAM_TOKEN_ALIASES = {
+    # Common soccer abbreviations/transliterations seen in odds feeds.
+    "man": "manchester",
+    "utd": "united",
+    "st": "saint",
+    "atl": "atletico",
+    "munchen": "munich",
+    "muenchen": "munich",
+    "mgladbach": "monchengladbach",
+    "gladbach": "monchengladbach",
+    "lisbon": "cp",
+}
+_MIN_ORIENTATION_TEAM_SCORE = 45
 
 
 def _looks_like_outright_key(key: str) -> bool:
@@ -39,22 +56,168 @@ def _format_name_with_point(name: str, point) -> str:
     return f"{name} ({point_text})"
 
 
-def _parse_outcome_pair(outcomes, title: str, include_point: bool = False) -> tuple[SportsOutcome, SportsOutcome] | None:
-    if not isinstance(outcomes, list) or len(outcomes) != 2:
+def _normalize_name(name: str) -> str:
+    raw = str(name or "").strip().lower()
+    ascii_text = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    return " ".join(ascii_text.split())
+
+
+def _name_tokens(name: str) -> list[str]:
+    return _NAME_TOKEN_RE.findall(_normalize_name(name))
+
+
+def _clean_team_tokens(name: str) -> list[str]:
+    cleaned = [t for t in _name_tokens(name) if t not in _TEAM_NOISE_TOKENS]
+    return [_TEAM_TOKEN_ALIASES.get(t, t) for t in cleaned]
+
+
+def _name_compact(name: str) -> str:
+    return "".join(_clean_team_tokens(name))
+
+
+def _acronym(tokens: list[str]) -> str:
+    return "".join(t[0] for t in tokens if t)
+
+
+def _is_draw_label(name: str) -> bool:
+    tokens = _clean_team_tokens(name)
+    if not tokens:
+        return False
+    compact = "".join(tokens)
+    return compact in {"draw", "tie", "x"}
+
+
+def _team_name_score(team_name: str, outcome_name: str) -> int:
+    team_tokens = _clean_team_tokens(team_name)
+    out_tokens = _clean_team_tokens(outcome_name)
+    if not team_tokens or not out_tokens:
+        return 0
+    team_key = " ".join(team_tokens)
+    out_key = " ".join(out_tokens)
+    if team_key == out_key:
+        return 100
+    if _name_compact(team_name) == _name_compact(outcome_name):
+        return 95
+    team_acr = _acronym(team_tokens)
+    out_acr = _acronym(out_tokens)
+    out_compact = "".join(out_tokens)
+    team_compact = "".join(team_tokens)
+    if team_acr and team_acr == out_compact:
+        return 90
+    if out_acr and out_acr == team_compact:
+        return 90
+    shared = len(set(team_tokens) & set(out_tokens))
+    score = shared * 20
+    if out_tokens and team_tokens and out_tokens[-1] == team_tokens[-1]:
+        score = max(score, 45)
+    if len(out_tokens) == 1 and out_tokens[0] in team_tokens:
+        score = max(score, 55)
+    return score
+
+
+def _orient_selected_rows(
+    selected: list[dict],
+    team_a: str,
+    team_b: str,
+) -> tuple[dict, dict] | None:
+    if len(selected) != 2:
         return None
-    if not isinstance(outcomes[0], dict) or not isinstance(outcomes[1], dict):
+    first, second = selected[0], selected[1]
+    name_first = str(first.get("name") or "")
+    name_second = str(second.get("name") or "")
+
+    a_first = _team_name_score(team_a, name_first)
+    b_second = _team_name_score(team_b, name_second)
+    a_second = _team_name_score(team_a, name_second)
+    b_first = _team_name_score(team_b, name_first)
+
+    opt_direct = a_first + b_second
+    opt_swapped = a_second + b_first
+    if max(opt_direct, opt_swapped) <= 0:
+        return None
+    if opt_direct >= opt_swapped:
+        if a_first >= _MIN_ORIENTATION_TEAM_SCORE and b_second >= _MIN_ORIENTATION_TEAM_SCORE:
+            return first, second
+        return None
+    if a_second >= _MIN_ORIENTATION_TEAM_SCORE and b_first >= _MIN_ORIENTATION_TEAM_SCORE:
+        return second, first
+    return None
+
+
+def _select_two_way_outcomes(outcomes, team_a: str = "", team_b: str = "") -> list[dict] | None:
+    """Return a 2-outcome view from raw market outcomes.
+
+    For standard two-way markets, this is the original list.
+    For soccer-style three-way h2h (home/away/draw), this selects only home/away.
+    """
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        return None
+    if len(outcomes) == 2:
+        return outcomes
+    name_a = _normalize_name(team_a)
+    name_b = _normalize_name(team_b)
+    if not name_a or not name_b:
+        return None
+    out_a = None
+    out_b = None
+    for row in outcomes:
+        if not isinstance(row, dict):
+            continue
+        row_name = _normalize_name(row.get("name"))
+        if row_name == name_a and out_a is None:
+            out_a = row
+        elif row_name == name_b and out_b is None:
+            out_b = row
+    if out_a is None or out_b is None:
+        # Fallback for 3-way soccer books: keep non-draw outcomes.
+        non_draw = [
+            row
+            for row in outcomes
+            if isinstance(row, dict) and not _is_draw_label(row.get("name"))
+        ]
+        if len(non_draw) == 2:
+            return non_draw
+        return None
+    return [out_a, out_b]
+
+
+def _parse_outcome_pair(
+    outcomes,
+    title: str,
+    include_point: bool = False,
+    team_a: str = "",
+    team_b: str = "",
+) -> tuple[SportsOutcome, SportsOutcome] | None:
+    selected = _select_two_way_outcomes(outcomes, team_a=team_a, team_b=team_b)
+    if selected is None:
+        return None
+    canonicalize_to_teams = False
+    if not include_point and team_a and team_b:
+        oriented = _orient_selected_rows(selected, team_a=team_a, team_b=team_b)
+        if oriented is None:
+            # For 3-way moneyline outcomes, skip ambiguous mappings.
+            if isinstance(outcomes, list) and len(outcomes) > 2:
+                return None
+        else:
+            selected = [oriented[0], oriented[1]]
+            canonicalize_to_teams = True
+    if not isinstance(selected[0], dict) or not isinstance(selected[1], dict):
         return None
 
-    name_a = str(outcomes[0].get("name") or "").strip()
-    name_b = str(outcomes[1].get("name") or "").strip()
-    price_a = outcomes[0].get("price")
-    price_b = outcomes[1].get("price")
+    name_a = str(selected[0].get("name") or "").strip()
+    name_b = str(selected[1].get("name") or "").strip()
+    price_a = selected[0].get("price")
+    price_b = selected[1].get("price")
     if not name_a or not name_b:
         return None
 
+    if canonicalize_to_teams:
+        name_a = str(team_a).strip() or name_a
+        name_b = str(team_b).strip() or name_b
+
     if include_point:
-        name_a = _format_name_with_point(name_a, outcomes[0].get("point"))
-        name_b = _format_name_with_point(name_b, outcomes[1].get("point"))
+        name_a = _format_name_with_point(name_a, selected[0].get("point"))
+        name_b = _format_name_with_point(name_b, selected[1].get("point"))
 
     try:
         o_a = SportsOutcome(
@@ -86,11 +249,23 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
                 key = str(market.get("key") or "").strip().lower()
                 outcomes = market.get("outcomes", [])
                 if key == "h2h":
-                    pair = _parse_outcome_pair(outcomes, title, include_point=False)
+                    pair = _parse_outcome_pair(
+                        outcomes,
+                        title,
+                        include_point=False,
+                        team_a=home,
+                        team_b=away,
+                    )
                     if pair is not None:
                         books[title] = pair
                 elif key == "spreads":
-                    pair = _parse_outcome_pair(outcomes, title, include_point=True)
+                    pair = _parse_outcome_pair(
+                        outcomes,
+                        title,
+                        include_point=True,
+                        team_a=home,
+                        team_b=away,
+                    )
                     if pair is not None:
                         spread_books[title] = pair
         if books or spread_books:
@@ -223,8 +398,8 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
             url = f"{ODDS_API_BASE}/sports/{sport}/odds/"
             params = {
                 "apiKey": api_key,
-                # Include major soccer/tennis bookmaker regions by default.
-                "regions": "us,uk,eu",
+                # Use US + France coverage.
+                "regions": "us,fr",
                 "markets": "h2h,spreads",
                 "oddsFormat": "american",
             }

@@ -1,5 +1,8 @@
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
+from math import isfinite
 
 from polyedge.data.polymarket import sport_to_tag_slug
 from polyedge.models import AllBookOdds, MatchedEvent, PolyMarket, SportsOutcome
@@ -48,6 +51,7 @@ TEAM_ALIASES: dict[str, list[str]] = {
     "Columbus Blue Jackets": ["Blue Jackets"], "Dallas Stars": ["Stars"],
     "Detroit Red Wings": ["Red Wings"], "Edmonton Oilers": ["Oilers"],
     "Florida Panthers": ["Panthers"], "Minnesota Wild": ["Wild"],
+    "Los Angeles Kings": ["Kings", "LA Kings"],
     "Montreal Canadiens": ["Canadiens", "Habs"],
     "Nashville Predators": ["Predators", "Preds"],
     "New Jersey Devils": ["Devils"], "New York Islanders": ["Islanders"],
@@ -56,6 +60,7 @@ TEAM_ALIASES: dict[str, list[str]] = {
     "San Jose Sharks": ["Sharks"], "Seattle Kraken": ["Kraken"],
     "St. Louis Blues": ["Blues"], "Tampa Bay Lightning": ["Lightning", "Bolts"],
     "Toronto Maple Leafs": ["Maple Leafs", "Leafs"],
+    "Utah Hockey Club": ["Utah HC", "Utah"],
     "Vancouver Canucks": ["Canucks"], "Vegas Golden Knights": ["Golden Knights", "VGK"],
     "Washington Capitals": ["Capitals", "Caps"], "Winnipeg Jets": ["Jets"],
     # MLB
@@ -77,16 +82,172 @@ TEAM_ALIASES: dict[str, list[str]] = {
     "Toronto Blue Jays": ["Blue Jays"], "Washington Nationals": ["Nationals", "Nats"],
 }
 
+TEAM_CODE_ALIASES: dict[str, list[str]] = {
+    # NHL 3-letter codes frequently used as outcome labels.
+    "Anaheim Ducks": ["ANA"],
+    "Boston Bruins": ["BOS"],
+    "Buffalo Sabres": ["BUF"],
+    "Calgary Flames": ["CGY"],
+    "Carolina Hurricanes": ["CAR"],
+    "Chicago Blackhawks": ["CHI"],
+    "Colorado Avalanche": ["COL"],
+    "Columbus Blue Jackets": ["CBJ"],
+    "Dallas Stars": ["DAL"],
+    "Detroit Red Wings": ["DET"],
+    "Edmonton Oilers": ["EDM"],
+    "Florida Panthers": ["FLA"],
+    "Minnesota Wild": ["MIN"],
+    "Montreal Canadiens": ["MTL"],
+    "Nashville Predators": ["NSH"],
+    "New Jersey Devils": ["NJD"],
+    "New York Islanders": ["NYI"],
+    "New York Rangers": ["NYR"],
+    "Ottawa Senators": ["OTT"],
+    "Philadelphia Flyers": ["PHI"],
+    "Pittsburgh Penguins": ["PIT"],
+    "San Jose Sharks": ["SJS"],
+    "Seattle Kraken": ["SEA"],
+    "St. Louis Blues": ["STL"],
+    "Tampa Bay Lightning": ["TBL"],
+    "Toronto Maple Leafs": ["TOR"],
+    "Utah Hockey Club": ["UTA", "UTH"],
+    "Vancouver Canucks": ["VAN"],
+    "Vegas Golden Knights": ["VGK"],
+    "Washington Capitals": ["WSH"],
+    "Winnipeg Jets": ["WPG"],
+}
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_SPREAD_POINT_RE = re.compile(r"\(\s*([+-]?\d+(?:\.\d+)?)\s*\)\s*$")
-# Gamma sports event timestamps are often stale by up to ~2 weeks.
-# Keep a broad guard to block clearly unrelated historical markets,
-# while still allowing current matchup markets with imperfect metadata.
-_MAX_START_TIME_DRIFT_SEC = 14 * 24 * 3600
+_NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_SPREAD_POINT_PARENS_RE = re.compile(r"\(\s*([+-]?\d+(?:\.\d+)?)\s*\)\s*$")
+_SPREAD_POINT_TRAILING_RE = re.compile(r"(?:^|\s)([+-]\d+(?:\.\d+)?)\s*$")
+# Safety-first: keep clearly wrong cross-date mismatches out while allowing
+# moderate feed/provider timestamp drift around game-day windows.
+_MAX_START_TIME_DRIFT_SEC = 36 * 3600
+_MAX_CROSS_DATE_DRIFT_SEC = 18 * 3600
+_MISSING_TIME_PENALTY = 200_000_000
+_MONEYLINE_SCORE_BONUS = 15_000
+_SPREAD_SCORE_WITH_BOOKS_BONUS = 8_000
+_SPREAD_SCORE_NO_BOOKS_PENALTY = 12_000
+
+
+@dataclass(frozen=True)
+class _MatchCandidate:
+    game_idx: int
+    poly_idx: int
+    matched: MatchedEvent
+    name_score: int
+    drift_sec: float
+    total_score: float
 
 
 def _tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(str(text).lower())
+
+
+def _normalized_key(text: str) -> str:
+    return " ".join(_tokenize(text))
+
+
+def _compact_key(text: str) -> str:
+    return "".join(_tokenize(text))
+
+
+def _build_alias_lookup(source: dict[str, list[str]]) -> dict[str, list[str]]:
+    lookup: dict[str, list[str]] = {}
+    for team_name, aliases in source.items():
+        key = _normalized_key(team_name)
+        if not key:
+            continue
+        existing = lookup.setdefault(key, [])
+        for alias in aliases:
+            alias_text = str(alias).strip()
+            if alias_text and alias_text not in existing:
+                existing.append(alias_text)
+    return lookup
+
+
+_TEAM_ALIAS_LOOKUP = _build_alias_lookup(TEAM_ALIASES)
+_TEAM_CODE_ALIAS_LOOKUP = _build_alias_lookup(TEAM_CODE_ALIASES)
+
+_TEAM_KEYS: tuple[str, ...] = tuple(
+    sorted(set(_TEAM_ALIAS_LOOKUP) | set(_TEAM_CODE_ALIAS_LOOKUP))
+)
+_TEAM_KEYS_BY_TAIL1: dict[str, list[str]] = {}
+_TEAM_KEYS_BY_TAIL2: dict[str, list[str]] = {}
+for _team_key in _TEAM_KEYS:
+    _tokens = _tokenize(_team_key)
+    if not _tokens:
+        continue
+    _TEAM_KEYS_BY_TAIL1.setdefault(_tokens[-1], []).append(_team_key)
+    if len(_tokens) >= 2:
+        _TEAM_KEYS_BY_TAIL2.setdefault(" ".join(_tokens[-2:]), []).append(_team_key)
+
+
+@lru_cache(maxsize=1024)
+def _candidate_team_keys_for_name(full_name: str) -> tuple[str, ...]:
+    tokens = _tokenize(full_name)
+    if not tokens:
+        return ()
+    key = " ".join(tokens)
+    candidates: set[str] = set()
+    if key in _TEAM_ALIAS_LOOKUP or key in _TEAM_CODE_ALIAS_LOOKUP:
+        candidates.add(key)
+    candidates.update(_TEAM_KEYS_BY_TAIL1.get(tokens[-1], []))
+    if len(tokens) >= 2:
+        candidates.update(_TEAM_KEYS_BY_TAIL2.get(" ".join(tokens[-2:]), []))
+    if not candidates:
+        return ()
+
+    token_set = set(tokens)
+    scored: list[tuple[int, str]] = []
+    for candidate_key in candidates:
+        candidate_tokens = _tokenize(candidate_key)
+        if not candidate_tokens:
+            continue
+        score = 0
+        if candidate_tokens == tokens:
+            score += 200
+        if len(candidate_tokens) >= 2 and len(tokens) >= 2:
+            if candidate_tokens[-2:] == tokens[-2:]:
+                score += 80
+        if candidate_tokens[-1] == tokens[-1]:
+            score += 50
+        score += len(token_set & set(candidate_tokens)) * 10
+        if candidate_tokens and tokens and candidate_tokens[0] == tokens[0]:
+            score += 8
+        if score > 0:
+            scored.append((score, candidate_key))
+    if not scored:
+        return ()
+    scored.sort(reverse=True)
+    best = scored[0][0]
+    keep = [team_key for score, team_key in scored if score >= max(30, best - 25)]
+    return tuple(keep)
+
+
+@lru_cache(maxsize=1024)
+def _team_form_keys(team_key: str) -> tuple[str, ...]:
+    forms: set[str] = {team_key}
+    for alias in _TEAM_ALIAS_LOOKUP.get(team_key, []):
+        key = _normalized_key(alias)
+        if key:
+            forms.add(key)
+    for alias in _TEAM_CODE_ALIAS_LOOKUP.get(team_key, []):
+        key = _normalized_key(alias)
+        if key:
+            forms.add(key)
+    return tuple(sorted(forms))
+
+
+@lru_cache(maxsize=1024)
+def _team_form_compacts(team_key: str) -> tuple[str, ...]:
+    compacts: set[str] = set()
+    for form in _team_form_keys(team_key):
+        compact = _compact_key(form)
+        if compact:
+            compacts.add(compact)
+    return tuple(sorted(compacts))
 
 
 def _contains_token_sequence(needle: list[str], haystack: list[str]) -> bool:
@@ -96,30 +257,98 @@ def _contains_token_sequence(needle: list[str], haystack: list[str]) -> bool:
     return any(haystack[i:i + n] == needle for i in range(len(haystack) - n + 1))
 
 
-def _names_match(full_name: str, candidate: str) -> bool:
-    """Match a canonical team name against an outcome label using token boundaries."""
+def _name_match_strength(full_name: str, candidate: str) -> int:
+    """Return a match strength score for team name vs candidate label."""
     full_tokens = _tokenize(full_name)
     candidate_tokens = _tokenize(candidate)
     if not full_tokens or not candidate_tokens:
-        return False
+        return 0
 
     if _contains_token_sequence(full_tokens, candidate_tokens):
-        return True
+        return 130
 
-    aliases = TEAM_ALIASES.get(full_name, [])
-    for alias in aliases:
-        alias_tokens = _tokenize(alias)
-        if _contains_token_sequence(alias_tokens, candidate_tokens):
-            return True
+    candidate_key = " ".join(candidate_tokens)
+    candidate_compact = "".join(candidate_tokens)
+    best = 0
 
-    # Lightweight fallback for markets that use only the team nickname.
-    return len(candidate_tokens) == 1 and candidate_tokens[0] == full_tokens[-1]
+    for team_key in _candidate_team_keys_for_name(full_name):
+        key_tokens = _tokenize(team_key)
+        if not key_tokens:
+            continue
+
+        for form_key in _team_form_keys(team_key):
+            form_tokens = _tokenize(form_key)
+            if not form_tokens:
+                continue
+            if candidate_key == form_key:
+                if form_key == team_key:
+                    best = max(best, 120)
+                elif len(form_tokens) == 1:
+                    best = max(best, 100)
+                else:
+                    best = max(best, 110)
+                continue
+            if _contains_token_sequence(form_tokens, candidate_tokens):
+                if form_key == team_key:
+                    best = max(best, 115)
+                elif len(form_tokens) == 1:
+                    best = max(best, 96)
+                else:
+                    best = max(best, 106)
+                continue
+            if len(candidate_tokens) >= 2 and _contains_token_sequence(candidate_tokens, form_tokens):
+                best = max(best, 90)
+
+        if candidate_compact in _team_form_compacts(team_key):
+            best = max(best, 104)
+
+        # Fallback when markets use only nickname (e.g. "Predators").
+        if len(candidate_tokens) == 1 and candidate_tokens[0] == key_tokens[-1]:
+            ambiguity = len(_TEAM_KEYS_BY_TAIL1.get(candidate_tokens[0], []))
+            best = max(best, 78 if ambiguity <= 2 else 68)
+        if len(candidate_tokens) >= 2 and len(key_tokens) >= 2:
+            if candidate_tokens[-2:] == key_tokens[-2:]:
+                best = max(best, 88)
+
+    if best > 0:
+        return best
+
+    # Last-resort fallback to preserve coverage for previously unseen teams.
+    if len(candidate_tokens) == 1 and candidate_tokens[0] == full_tokens[-1]:
+        return 64
+    return 0
+
+
+def _names_match(full_name: str, candidate: str) -> bool:
+    """Boolean wrapper used by spread orientation helper."""
+    return _name_match_strength(full_name, candidate) > 0
 
 
 def _parse_iso_utc(raw: str) -> datetime | None:
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if not isfinite(val):
+            return None
+        # Handle millisecond epochs.
+        if abs(val) > 1e12:
+            val /= 1000.0
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+
     text = str(raw or "").strip()
     if not text:
         return None
+    if _NUMERIC_TS_RE.match(text):
+        try:
+            val = float(text)
+        except ValueError:
+            val = float("nan")
+        if isfinite(val):
+            if abs(val) > 1e12:
+                val /= 1000.0
+            try:
+                return datetime.fromtimestamp(val, tz=timezone.utc)
+            except Exception:
+                pass
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except Exception:
@@ -135,7 +364,11 @@ def _start_times_compatible(odds_commence_time: str, poly_start_iso: str) -> boo
     if odds_start is None or poly_start is None:
         return True
     drift_sec = abs((odds_start - poly_start).total_seconds())
-    return drift_sec <= _MAX_START_TIME_DRIFT_SEC
+    if drift_sec > _MAX_START_TIME_DRIFT_SEC:
+        return False
+    if odds_start.date() != poly_start.date() and drift_sec > _MAX_CROSS_DATE_DRIFT_SEC:
+        return False
+    return True
 
 
 def start_time_drift_seconds(odds_commence_time: str, poly_start_iso: str) -> float:
@@ -167,7 +400,16 @@ def orient_book_outcomes(
 
 
 def _extract_spread_point(text: str) -> float | None:
-    m = _SPREAD_POINT_RE.search(str(text or "").strip())
+    normalized = (
+        str(text or "")
+        .strip()
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    m = _SPREAD_POINT_PARENS_RE.search(normalized)
+    if not m:
+        m = _SPREAD_POINT_TRAILING_RE.search(normalized)
     if not m:
         return None
     try:
@@ -178,15 +420,24 @@ def _extract_spread_point(text: str) -> float | None:
 
 def _extract_named_point(question: str, team_name: str) -> float | None:
     team = str(team_name or "").strip()
-    q = str(question or "")
+    q = (
+        str(question or "")
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
     if not team or not q:
         return None
-    pattern = re.compile(rf"{re.escape(team)}\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*\)", re.IGNORECASE)
+    pattern = re.compile(
+        rf"{re.escape(team)}\s*(?:\(\s*([+-]?\d+(?:\.\d+)?)\s*\)|([+-]\d+(?:\.\d+)?))",
+        re.IGNORECASE,
+    )
     m = pattern.search(q)
     if not m:
         return None
     try:
-        return float(m.group(1))
+        point_token = m.group(1) if m.group(1) is not None else m.group(2)
+        return float(point_token)
     except (TypeError, ValueError):
         return None
 
@@ -234,26 +485,22 @@ def match_events(
     Each Polymarket market is used at most once (first-come, first-served).
     """
     results: list[MatchedEvent] = []
-    used_polys: set[int] = set()
-    for game in games:
+    game_candidates: dict[int, list[_MatchCandidate]] = {}
+
+    for game_idx, game in enumerate(games):
         expected_slug = sport_to_tag_slug(game.sport)
-        best_index = None
-        best_match: MatchedEvent | None = None
-        best_drift = float("inf")
-        for i, poly in enumerate(polys):
-            if i in used_polys:
-                continue
+        candidates: list[_MatchCandidate] = []
+        for poly_idx, poly in enumerate(polys):
             # Cross-sport guard: only match within same sport
             if expected_slug and poly.sport_tag and poly.sport_tag != expected_slug:
                 continue
-            if not _start_times_compatible(game.commence_time, poly.start_iso):
-                continue
 
-            home_a = _names_match(game.home, poly.outcome_a)
-            away_b = _names_match(game.away, poly.outcome_b)
-            home_b = _names_match(game.home, poly.outcome_b)
-            away_a = _names_match(game.away, poly.outcome_a)
-            if home_a and away_b:
+            home_a = _name_match_strength(game.home, poly.outcome_a)
+            away_b = _name_match_strength(game.away, poly.outcome_b)
+            home_b = _name_match_strength(game.home, poly.outcome_b)
+            away_a = _name_match_strength(game.away, poly.outcome_a)
+            if home_a > 0 and away_b > 0:
+                name_score = home_a + away_b
                 candidate = MatchedEvent(
                     sport=game.sport,
                     all_odds=game,
@@ -261,7 +508,8 @@ def match_events(
                     team_a=game.home,
                     team_b=game.away,
                 )
-            elif home_b and away_a:
+            elif home_b > 0 and away_a > 0:
+                name_score = home_b + away_a
                 candidate = MatchedEvent(
                     sport=game.sport,
                     all_odds=game,
@@ -270,15 +518,96 @@ def match_events(
                     team_b=game.home,
                 )
             else:
-                continue
+                # Fallback: some exchanges label outcomes generically ("Home/Away")
+                # while event_title still contains team names.
+                out_a = str(poly.outcome_a or "").strip().lower()
+                out_b = str(poly.outcome_b or "").strip().lower()
+                generic_labels = {
+                    "home", "away", "team a", "team b", "teama", "teamb", "a", "b", "1", "2"
+                }
+                yes_no = {out_a, out_b} == {"yes", "no"}
+                generic_outcomes = out_a in generic_labels and out_b in generic_labels
+                title_home = _name_match_strength(game.home, poly.event_title)
+                title_away = _name_match_strength(game.away, poly.event_title)
+                if yes_no or not generic_outcomes or not (title_home and title_away):
+                    continue
+                name_score = title_home + title_away
+                candidate = MatchedEvent(
+                    sport=game.sport,
+                    all_odds=game,
+                    poly_market=poly,
+                    team_a=game.home,
+                    team_b=game.away,
+                )
 
             drift = start_time_drift_seconds(game.commence_time, poly.start_iso)
-            if best_match is None or drift < best_drift:
-                best_match = candidate
-                best_index = i
-                best_drift = drift
+            if isfinite(drift) and not _start_times_compatible(game.commence_time, poly.start_iso):
+                continue
 
-        if best_match is not None and best_index is not None:
-            results.append(best_match)
-            used_polys.add(best_index)
+            market_bonus = 0.0
+            if getattr(poly, "market_type", "moneyline") == "moneyline":
+                market_bonus += _MONEYLINE_SCORE_BONUS
+            elif getattr(poly, "market_type", "moneyline") == "spread":
+                market_bonus += (
+                    _SPREAD_SCORE_WITH_BOOKS_BONUS
+                    if bool(getattr(game, "spread_books", {}))
+                    else -_SPREAD_SCORE_NO_BOOKS_PENALTY
+                )
+
+            total_score = float(name_score * 100_000 + market_bonus)
+            if isfinite(drift):
+                total_score -= drift
+                odds_start = _parse_iso_utc(game.commence_time)
+                poly_start = _parse_iso_utc(poly.start_iso)
+                if odds_start and poly_start and odds_start.date() == poly_start.date():
+                    total_score += 10_000
+            else:
+                total_score -= _MISSING_TIME_PENALTY
+
+            candidates.append(
+                _MatchCandidate(
+                    game_idx=game_idx,
+                    poly_idx=poly_idx,
+                    matched=candidate,
+                    name_score=name_score,
+                    drift_sec=drift,
+                    total_score=total_score,
+                )
+            )
+
+        if not candidates:
+            continue
+
+        # Prefer parseable start times.
+        finite_candidates = [c for c in candidates if isfinite(c.drift_sec)]
+        if finite_candidates:
+            game_candidates[game_idx] = finite_candidates
+            continue
+
+        # No parseable start times at all: require clear winner by name score.
+        sorted_missing = sorted(candidates, key=lambda c: c.total_score, reverse=True)
+        if len(sorted_missing) == 1:
+            game_candidates[game_idx] = sorted_missing
+            continue
+        score_gap = sorted_missing[0].total_score - sorted_missing[1].total_score
+        if (
+            sorted_missing[0].name_score >= sorted_missing[1].name_score + 15
+            or score_gap >= 12_000
+        ):
+            game_candidates[game_idx] = [sorted_missing[0]]
+
+    # Global greedy assignment by candidate quality to avoid local first-match traps.
+    all_candidates: list[_MatchCandidate] = []
+    for game_idx, cands in game_candidates.items():
+        _ = game_idx  # satisfy linters for explicit intent
+        all_candidates.extend(sorted(cands, key=lambda c: c.total_score, reverse=True))
+
+    used_games: set[int] = set()
+    used_polys: set[int] = set()
+    for cand in sorted(all_candidates, key=lambda c: c.total_score, reverse=True):
+        if cand.game_idx in used_games or cand.poly_idx in used_polys:
+            continue
+        results.append(cand.matched)
+        used_games.add(cand.game_idx)
+        used_polys.add(cand.poly_idx)
     return results
