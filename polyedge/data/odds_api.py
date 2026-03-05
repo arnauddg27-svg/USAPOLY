@@ -21,7 +21,44 @@ _SPORT_WILDCARDS = {
     "soccer_*": "soccer_",
     "tennis_all": "tennis_",
     "tennis_*": "tennis_",
+    "cricket_all": "cricket_",
+    "cricket_*": "cricket_",
+    "rugby_all": ("rugby_", "rugbyleague_"),
+    "rugby_*": ("rugby_", "rugbyleague_"),
+    "rugbyleague_all": "rugbyleague_",
+    "rugbyleague_*": "rugbyleague_",
+    "rugby_league_all": "rugbyleague_",
+    "rugby_league_*": "rugbyleague_",
+    "table_tennis_all": "table_tennis_",
+    "table_tennis_*": "table_tennis_",
 }
+_SPORT_FAMILY_ALIASES = {
+    # Keep explicit high-signal config keys stable year-round by resolving to
+    # currently active tournament/league keys from /sports.
+    "tennis_atp": "tennis_atp_",
+    "tennis_wta": "tennis_wta_",
+    "cricket": "cricket_",
+    "rugby": ("rugby_", "rugbyleague_"),
+    "rugbyleague": "rugbyleague_",
+    "rugby_league": "rugbyleague_",
+    "table_tennis": "table_tennis_",
+}
+_CRICKET_FALLBACK_KEYS = (
+    "cricket_asia_cup",
+    "cricket_big_bash",
+    "cricket_caribbean_premier_league",
+    "cricket_icc_trophy",
+    "cricket_icc_world_cup",
+    "cricket_icc_world_cup_womens",
+    "cricket_international_t20",
+    "cricket_ipl",
+    "cricket_odi",
+    "cricket_psl",
+    "cricket_t20_blast",
+    "cricket_t20_world_cup",
+    "cricket_test_match",
+    "cricket_the_hundred",
+)
 _NAME_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _TEAM_NOISE_TOKENS = {"fc", "cf", "sc", "ac", "afc", "club", "w", "women", "de", "la"}
 _TEAM_TOKEN_ALIASES = {
@@ -192,10 +229,10 @@ def _parse_outcome_pair(
     if selected is None:
         return None
     canonicalize_to_teams = False
-    if not include_point and team_a and team_b:
+    if team_a and team_b:
         oriented = _orient_selected_rows(selected, team_a=team_a, team_b=team_b)
         if oriented is None:
-            # For 3-way moneyline outcomes, skip ambiguous mappings.
+            # For 3-way outcomes, skip ambiguous mappings.
             if isinstance(outcomes, list) and len(outcomes) > 2:
                 return None
         else:
@@ -283,7 +320,7 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
 
 
 def expand_sport_keys(requested_sports: list[str], available_sports: list[str]) -> list[str]:
-    """Expand wildcard sport tokens into concrete The Odds API sport keys."""
+    """Expand wildcard and family tokens into concrete The Odds API sport keys."""
     available: list[str] = []
     seen_available: set[str] = set()
     for raw in available_sports:
@@ -295,21 +332,64 @@ def expand_sport_keys(requested_sports: list[str], available_sports: list[str]) 
 
     resolved: list[str] = []
     seen_resolved: set[str] = set()
+
+    def _matches_prefix(key: str, prefix_spec: str | tuple[str, ...]) -> bool:
+        if isinstance(prefix_spec, tuple):
+            return any(key.startswith(p) for p in prefix_spec)
+        return key.startswith(prefix_spec)
+
     for raw in requested_sports:
         token = str(raw or "").strip().lower()
         if not token:
             continue
         wildcard_prefix = _SPORT_WILDCARDS.get(token)
-        if wildcard_prefix is None:
-            if token not in seen_resolved:
-                seen_resolved.add(token)
-                resolved.append(token)
+        if wildcard_prefix is not None:
+            for key in available:
+                if _matches_prefix(key, wildcard_prefix) and key not in seen_resolved:
+                    seen_resolved.add(key)
+                    resolved.append(key)
             continue
-        for key in available:
-            if key.startswith(wildcard_prefix) and key not in seen_resolved:
-                seen_resolved.add(key)
-                resolved.append(key)
+
+        family_prefix = _SPORT_FAMILY_ALIASES.get(token)
+        if family_prefix is not None:
+            for key in available:
+                if (key == token or _matches_prefix(key, family_prefix)) and key not in seen_resolved:
+                    seen_resolved.add(key)
+                    resolved.append(key)
+            continue
+
+        if token not in seen_resolved:
+            seen_resolved.add(token)
+            resolved.append(token)
     return resolved
+
+
+def augment_sport_keys_with_fallbacks(
+    requested_sports: list[str],
+    resolved_sports: list[str],
+) -> list[str]:
+    """Append hard fallback keys for families that need year-round probing."""
+    requested_tokens = {str(s or "").strip().lower() for s in requested_sports}
+    want_cricket_fallbacks = bool(
+        {"cricket", "cricket_all", "cricket_*"} & requested_tokens
+    )
+
+    augmented: list[str] = []
+    seen: set[str] = set()
+    for raw in resolved_sports:
+        key = str(raw or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        augmented.append(key)
+
+    if want_cricket_fallbacks:
+        for key in _CRICKET_FALLBACK_KEYS:
+            if key in seen:
+                continue
+            seen.add(key)
+            augmented.append(key)
+    return augmented
 
 
 def _extract_available_sport_keys(payload: list[dict]) -> list[str]:
@@ -353,7 +433,12 @@ async def _fetch_available_sport_keys(session: aiohttp.ClientSession, api_key: s
         return []
 
 
-async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
+async def fetch_all_odds(
+    sports: list[str],
+    api_key: str,
+    regions: str = "us,fr,uk",
+    cricket_regions: str = "us,uk,eu,au",
+) -> list[AllBookOdds]:
     """Fetch odds for all configured sports, keeping all bookmakers.
 
     Args:
@@ -371,9 +456,15 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
         return []
 
     all_games: list[AllBookOdds] = []
+    configured_regions = str(regions or "").strip() or "us,fr,uk"
+    configured_cricket_regions = str(cricket_regions or "").strip() or configured_regions
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         resolved_sports = requested_sports
-        if any(str(s).strip().lower() in _SPORT_WILDCARDS for s in requested_sports):
+        if any(
+            str(s).strip().lower() in _SPORT_WILDCARDS
+            or str(s).strip().lower() in _SPORT_FAMILY_ALIASES
+            for s in requested_sports
+        ):
             available_keys = await _fetch_available_sport_keys(session, api_key)
             expanded = expand_sport_keys(requested_sports, available_keys)
             if expanded:
@@ -385,7 +476,10 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
                 )
             else:
                 resolved_sports = [
-                    s for s in requested_sports if str(s).strip().lower() not in _SPORT_WILDCARDS
+                    s
+                    for s in requested_sports
+                    if str(s).strip().lower() not in _SPORT_WILDCARDS
+                    and str(s).strip().lower() not in _SPORT_FAMILY_ALIASES
                 ]
                 if not resolved_sports:
                     logger.warning(
@@ -394,12 +488,21 @@ async def fetch_all_odds(sports: list[str], api_key: str) -> list[AllBookOdds]:
                     )
                     return []
 
+        resolved_sports = augment_sport_keys_with_fallbacks(
+            requested_sports,
+            resolved_sports,
+        )
+
         for sport in resolved_sports:
+            sport_regions = (
+                configured_cricket_regions
+                if str(sport).startswith("cricket_")
+                else configured_regions
+            )
             url = f"{ODDS_API_BASE}/sports/{sport}/odds/"
             params = {
                 "apiKey": api_key,
-                # Use US + France coverage.
-                "regions": "us,fr",
+                "regions": sport_regions,
                 "markets": "h2h,spreads",
                 "oddsFormat": "american",
             }

@@ -31,10 +31,19 @@ def sport_to_tag_slug(sport_key: str) -> str:
         return "soccer"
     if key.startswith("tennis_"):
         return "tennis"
+    if key.startswith("cricket_"):
+        return "cricket"
+    if key in {"rugby", "rugby_all", "rugby_*"}:
+        return "rugby"
+    if key.startswith("rugby_") or key.startswith("rugbyleague_"):
+        return "rugby"
+    if key.startswith("table_tennis_"):
+        return "table-tennis"
     return ""
 
 _SPREAD_PATTERN = re.compile(r"[+-]\s*\d+(?:\.\d+)?")
 _NUMERIC_PARENS_PATTERN = re.compile(r"\(\s*[+-]?\s*\d+(?:\.\d+)?\s*\)")
+_OVER_UNDER_RE = re.compile(r"\b(?:over|under)\b")
 _MONEYLINE_HINTS = (
     "moneyline",
     "match winner",
@@ -53,6 +62,52 @@ _TOTAL_HINTS = (
     "over",
     "under",
 )
+_NON_MATCH_PROP_HINTS = (
+    "set winner",
+    "total sets",
+    "set handicap",
+    "set spread",
+    "set total",
+    "period winner",
+    "total periods",
+    "halftime",
+    "half-time",
+    "first-half",
+    "second-half",
+    "regulation winner",
+    "in regulation",
+    "after 60",
+    "60-minute",
+    "60 minute",
+    "60 min",
+    "series winner",
+)
+_SEGMENT_MARKET_RE = re.compile(
+    r"\b(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth)\s+"
+    r"(?:set|period|quarter|half|inning|map|game)\b"
+)
+_SEGMENT_SHORT_RE = re.compile(
+    r"\b(?:1h|2h|h1|h2|"
+    r"1q|2q|3q|4q|q1|q2|q3|q4|"
+    r"1p|2p|3p|p1|p2|p3)\b"
+)
+_SET_N_WINNER_RE = re.compile(
+    r"\bset\s*(?:\d+|first|second|third|fourth|fifth)\s+winner\b"
+)
+_MATCHUP_HINT_RE = re.compile(r"\bvs\.?\b|\bv\b|@")
+_YES_NO_MONEYLINE_RE = re.compile(
+    r"\bwill\s+.+?\s+(?:win|beat|defeat)\b",
+    re.IGNORECASE,
+)
+
+
+def _first_non_empty(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
 
 def compute_avg_fill_price(asks: list[BookLevel], target_shares: float) -> tuple[float, float]:
     """Walk the order book to compute volume-weighted avg fill price.
@@ -120,7 +175,9 @@ def _looks_like_total(text: str) -> bool:
         return False
     if " o/u" in t or "o/u " in t:
         return True
-    return any(kw in t for kw in _TOTAL_HINTS)
+    if "total" in t:
+        return True
+    return _OVER_UNDER_RE.search(t) is not None
 
 
 def _looks_like_spread(text: str) -> bool:
@@ -134,16 +191,54 @@ def _looks_like_spread(text: str) -> bool:
     return any(kw in t for kw in _SPREAD_HINTS)
 
 
-def _classify_market_type(market: dict, outcomes: list[str]) -> str | None:
+def _looks_like_non_match_prop(text: str) -> bool:
+    t = str(text).strip().lower()
+    if not t:
+        return False
+    if _SEGMENT_MARKET_RE.search(t):
+        return True
+    if _SEGMENT_SHORT_RE.search(t):
+        return True
+    if _SET_N_WINNER_RE.search(t):
+        return True
+    return any(kw in t for kw in _NON_MATCH_PROP_HINTS)
+
+
+def _classify_market_type(
+    market: dict,
+    outcomes: list[str],
+    event_title: str = "",
+    sport_tag: str = "",
+) -> str | None:
     outcomes_lower = [str(o).strip().lower() for o in outcomes]
-    if any(o in {"yes", "no"} for o in outcomes_lower):
-        return None
+    yes_no_market = set(outcomes_lower) == {"yes", "no"}
+    sport_tag_l = str(sport_tag or "").strip().lower()
 
     question = str(market.get("question") or "").strip().lower()
     market_title = str(market.get("title") or "").strip().lower()
-    all_text = [question, market_title, *outcomes_lower]
+    event_title_l = str(event_title or "").strip().lower()
+    all_text = [question, market_title, event_title_l, *outcomes_lower]
 
+    # Guardrail: skip intra-match and prop markets (1st set/period, regulation, etc.).
+    if any(_looks_like_non_match_prop(text) for text in all_text):
+        return None
     if any(_looks_like_total(text) for text in all_text):
+        return None
+    if yes_no_market:
+        # Some sports expose full-match outcomes as "Will Team X win/cover?"
+        # with Yes/No outcomes. Keep only clear matchup markets and still
+        # block draw/tie and segment props via guardrails above.
+        if "draw" in question or "tie" in question:
+            return None
+        has_matchup = any(_MATCHUP_HINT_RE.search(text) for text in (question, market_title, event_title_l) if text)
+        if not has_matchup:
+            return None
+        if any(_looks_like_spread(text) for text in (question, market_title, event_title_l) if text):
+            return "spread"
+        if sport_tag_l == "soccer" and _YES_NO_MONEYLINE_RE.search(question):
+            return "moneyline"
+        if sport_tag_l == "rugby" and "win" in question:
+            return "moneyline"
         return None
     if any(_looks_like_spread(text) for text in all_text):
         return "spread"
@@ -151,9 +246,10 @@ def _classify_market_type(market: dict, outcomes: list[str]) -> str | None:
         return "moneyline"
     if market_title and any(hint in market_title for hint in _MONEYLINE_HINTS):
         return "moneyline"
-    # If both outcomes look like team names and no spread/total signal was found,
-    # treat as moneyline-style market.
-    return "moneyline"
+    # Fallback only when text looks like an explicit head-to-head matchup.
+    if any(_MATCHUP_HINT_RE.search(text) for text in (question, market_title, event_title_l) if text):
+        return "moneyline"
+    return None
 
 
 def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMarket]:
@@ -171,7 +267,12 @@ def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMar
         condition_id = str(market.get("conditionId", "")).strip()
         if not condition_id:
             continue
-        market_type = _classify_market_type(market, outcomes)
+        market_type = _classify_market_type(
+            market,
+            outcomes,
+            event_title=str(event.get("title") or ""),
+            sport_tag=sport_tag,
+        )
         if market_type is None:
             continue
 
@@ -186,7 +287,22 @@ def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMar
                 market_type=market_type,
                 sport_tag=sport_tag,
                 question=str(market.get("question") or ""),
-                start_iso=str(event.get("startDate") or event.get("startTime") or ""),
+                start_iso=_first_non_empty(
+                    market.get("gameStartTime"),
+                    market.get("eventStartTime"),
+                    market.get("startTime"),
+                    market.get("eventStartDate"),
+                    market.get("endDate"),
+                    market.get("start"),
+                    market.get("startDate"),
+                    event.get("gameStartTime"),
+                    event.get("eventStartTime"),
+                    event.get("startTime"),
+                    event.get("eventStartDate"),
+                    event.get("endDate"),
+                    event.get("start"),
+                    event.get("startDate"),
+                ),
             )
         )
     return results

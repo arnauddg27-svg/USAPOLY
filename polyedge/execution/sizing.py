@@ -1,9 +1,7 @@
-def compute_bet_size(
-    adjusted_edge: float, fill_price: float, bankroll: float,
-    fraction_kelly: float, max_per_event_pct: float,
-    total_exposure: float, max_total_pct: float,
-    cash_buffer_pct: float, book_depth_usd: float, min_bet: float,
-    sport_exposure: float = 0.0, max_per_sport_pct: float = 0.10,
+def _kelly_bet_pct(
+    adjusted_edge: float,
+    fill_price: float,
+    fraction_kelly: float,
     min_edge: float = 0.03,
 ) -> float:
     if fill_price <= 0 or fill_price >= 1:
@@ -19,14 +17,69 @@ def compute_bet_size(
     edge_span = max(0.20 - min_edge, 1e-6)
     edge_pos = max(0.0, min(1.0, (edge - min_edge) / edge_span))
     edge_multiplier = 1.0 + 0.5 * edge_pos
-    bet = bankroll * kelly_adj * edge_multiplier
+    return max(0.0, kelly_adj * edge_multiplier)
 
-    # Hard safety ceilings prevent accidental oversized single bets.
-    safe_event_pct = min(max(max_per_event_pct, 0.0), 0.05)
-    safe_sport_pct = min(max(max_per_sport_pct, 0.0), 0.20)
-    safe_total_pct = min(max(max_total_pct, 0.0), 0.30)
 
-    bet = min(bet, bankroll * safe_event_pct)
+def compute_event_cap_pct(
+    adjusted_edge: float,
+    fill_price: float,
+    fraction_kelly: float,
+    max_per_event_pct: float,
+    event_cap_kelly_multiplier: float = 3.0,
+    min_edge: float = 0.03,
+) -> float:
+    # Respect caller-provided limits directly.
+    safe_event_pct = max(max_per_event_pct, 0.0)
+    safe_kelly_mult = max(event_cap_kelly_multiplier, 0.0)
+    kelly_pct = _kelly_bet_pct(
+        adjusted_edge=adjusted_edge,
+        fill_price=fill_price,
+        fraction_kelly=fraction_kelly,
+        min_edge=min_edge,
+    )
+    if kelly_pct <= 0:
+        return 0.0
+    return min(safe_event_pct, kelly_pct * safe_kelly_mult)
+
+
+def compute_bet_size(
+    adjusted_edge: float,
+    fill_price: float,
+    bankroll: float,
+    fraction_kelly: float,
+    max_per_event_pct: float,
+    total_exposure: float,
+    max_total_pct: float,
+    cash_buffer_pct: float,
+    book_depth_usd: float,
+    min_bet: float,
+    event_exposure: float = 0.0,
+    sport_exposure: float = 0.0,
+    max_per_sport_pct: float = 0.10,
+    event_cap_kelly_multiplier: float = 3.0,
+    min_edge: float = 0.03,
+) -> float:
+    kelly_pct = _kelly_bet_pct(
+        adjusted_edge=adjusted_edge,
+        fill_price=fill_price,
+        fraction_kelly=fraction_kelly,
+        min_edge=min_edge,
+    )
+    event_cap_pct = compute_event_cap_pct(
+        adjusted_edge=adjusted_edge,
+        fill_price=fill_price,
+        fraction_kelly=fraction_kelly,
+        max_per_event_pct=max_per_event_pct,
+        event_cap_kelly_multiplier=event_cap_kelly_multiplier,
+        min_edge=min_edge,
+    )
+    bet = bankroll * kelly_pct
+
+    # Respect caller-provided limits directly.
+    safe_sport_pct = max(max_per_sport_pct, 0.0)
+    safe_total_pct = max(max_total_pct, 0.0)
+
+    bet = min(bet, bankroll * event_cap_pct - event_exposure)
     bet = min(bet, bankroll * safe_sport_pct - sport_exposure)
     bet = min(bet, bankroll * safe_total_pct - total_exposure)
     bet = min(bet, book_depth_usd * 0.8)

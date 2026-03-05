@@ -20,6 +20,7 @@ def log_decision(
             "cycle": cycle,
             "event": opp.matched_event.poly_market.event_title,
             "event_start": opp.matched_event.all_odds.commence_time,
+            "poly_event_start": opp.matched_event.poly_market.start_iso,
             "sport": opp.matched_event.sport,
             "condition_id": opp.matched_event.poly_market.condition_id,
             "market_question": opp.matched_event.poly_market.question,

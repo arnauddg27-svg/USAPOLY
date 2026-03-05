@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,21 @@ ORDER_ACTIONS = {"SUBMITTED", "PLACED"}  # PLACED kept for backward compatibilit
 EXECUTION_ACTIONS = ORDER_ACTIONS | {"SIMULATED"}
 
 ALTAIR_THEME_NAME = "polyedge_light"
+try:
+    _decision_days_env = int(os.getenv("DASHBOARD_DECISION_DAYS", "1"))
+except ValueError:
+    _decision_days_env = 1
+DECISION_LOAD_DAYS = max(1, min(_decision_days_env, 1))
+try:
+    _decision_lines_env = int(os.getenv("DASHBOARD_MAX_DECISION_LINES", "50000"))
+except ValueError:
+    _decision_lines_env = 50000
+DECISION_MAX_LINES = max(5_000, min(_decision_lines_env, 100_000))
+try:
+    _dashboard_http_timeout_env = float(os.getenv("DASHBOARD_HTTP_TIMEOUT_SEC", "2.0"))
+except ValueError:
+    _dashboard_http_timeout_env = 2.0
+DASHBOARD_HTTP_TIMEOUT_SEC = max(0.5, min(_dashboard_http_timeout_env, 10.0))
 
 
 def _read_env_value(key: str) -> str:
@@ -87,6 +103,15 @@ def _to_float_or_none(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_float(v, default: float) -> float:
+    parsed = _to_float_or_none(v)
+    return float(parsed) if parsed is not None else float(default)
+
+
+def _clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
 
 
 def _fmt_prob_pct(v) -> str:
@@ -189,6 +214,17 @@ def _sport_prefix_for_token(token: str) -> str | None:
         return t[:-3]
     if t.endswith("_*"):
         return t[:-1]
+    # Family keys resolve to rotating league/tournament keys in Odds API.
+    if t == "tennis_atp":
+        return "tennis_atp_"
+    if t == "tennis_wta":
+        return "tennis_wta_"
+    if t == "cricket":
+        return "cricket_"
+    if t == "rugby":
+        return "rugby_"
+    if t == "table_tennis":
+        return "table_tennis_"
     return None
 
 
@@ -199,6 +235,10 @@ def _sport_matches_token(sport_value: str, token: str) -> bool:
     token_norm = str(token or "").strip().lower()
     if not token_norm:
         return False
+    if token_norm in {"rugby", "rugby_all", "rugby_*"}:
+        return sport.startswith("rugby_") or sport.startswith("rugbyleague_")
+    if token_norm in {"rugbyleague", "rugbyleague_all", "rugbyleague_*", "rugby_league", "rugby_league_all", "rugby_league_*"}:
+        return sport.startswith("rugbyleague_")
     prefix = _sport_prefix_for_token(token_norm)
     if prefix is not None:
         return sport.startswith(prefix)
@@ -261,23 +301,180 @@ def _has_actions(df: pd.DataFrame, actions: set[str]) -> pd.Series:
     return df["action"].isin(actions)
 
 
-@st.cache_data(ttl=8, show_spinner=False)
-def load_decisions(days: int = 7) -> pd.DataFrame:
-    files = sorted(glob.glob(str(AUDIT_DIR / "decisions_*.jsonl")))[-days:]
-    rows = []
-    for path in files:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
+def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+    safe = df.copy()
+    for col in safe.columns:
+        if pd.api.types.is_datetime64_any_dtype(safe[col]):
+            safe[col] = pd.to_datetime(safe[col], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             continue
+        if safe[col].apply(lambda v: isinstance(v, (dict, list))).any():
+            safe[col] = safe[col].apply(
+                lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
+            )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        safe.to_excel(writer, index=False, sheet_name="decision_log")
+    return output.getvalue()
+
+
+def _prepare_decision_log_df(source_df: pd.DataFrame) -> pd.DataFrame:
+    prepared = source_df.copy()
+
+    if {"buy_outcome", "outcome_a", "outcome_b"}.issubset(prepared.columns):
+        prepared["selected_outcome"] = prepared.apply(
+            lambda row: row["outcome_a"] if row["buy_outcome"] == "a" else row["outcome_b"],
+            axis=1,
+        )
+    elif "buy_outcome" in prepared.columns:
+        prepared["selected_outcome"] = prepared["buy_outcome"].fillna("").astype(str).str.upper()
+
+    if "true_prob" in prepared.columns:
+        prepared["consensus_prob"] = prepared["true_prob"].apply(_fmt_prob_pct)
+        prepared["consensus_odds"] = prepared["true_prob"].apply(_prob_to_american)
+    if {"agg_prob_a", "agg_prob_b"}.issubset(prepared.columns):
+        prepared["agg_market"] = prepared.apply(
+            lambda row: f"A {row['agg_prob_a'] * 100:.1f}% vs B {row['agg_prob_b'] * 100:.1f}%"
+            if pd.notna(row["agg_prob_a"]) and pd.notna(row["agg_prob_b"])
+            else "—",
+            axis=1,
+        )
+    if "poly_fill" in prepared.columns:
+        prepared["poly_fill_prob"] = prepared["poly_fill"].apply(_fmt_prob_pct)
+    if "adjusted_edge" in prepared.columns:
+        prepared["edge_pp"] = (prepared["adjusted_edge"] * 100).round(2).astype(str) + "pp"
+    if {"raw_edge", "adjusted_edge", "true_prob", "poly_fill"}.issubset(prepared.columns):
+        prepared["edge_breakdown"] = [_edge_breakdown_text(row) for _, row in prepared.iterrows()]
+
+    cols = [
+        "timestamp",
+        "action",
+        "event",
+        "sport",
+        "market_type",
+        "selected_outcome",
+        "edge_breakdown",
+        "reject_reason",
+        "consensus_prob",
+        "consensus_odds",
+        "poly_fill_prob",
+        "edge_pp",
+        "books_used",
+        "bet_usd",
+        "condition_id",
+        "agg_market",
+        "market_question",
+        "event_start",
+        "sim_expected_pnl_usd",
+        "sim_bankroll_after_usd",
+    ]
+    cols = [c for c in cols if c in prepared.columns]
+    return prepared[cols].copy()
+
+
+def _safe_dataframe(df: pd.DataFrame, *, use_container_width: bool = True, hide_index: bool = True) -> None:
+    try:
+        st.dataframe(df, use_container_width=use_container_width, hide_index=hide_index)
+        return
+    except Exception:
+        safe = df.copy()
+        for col in safe.columns:
+            if pd.api.types.is_datetime64_any_dtype(safe[col]):
+                safe[col] = pd.to_datetime(safe[col], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+                continue
+            if safe[col].dtype == "object":
+                safe[col] = safe[col].apply(
+                    lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else ("" if v is None else str(v))
+                )
+        st.dataframe(safe, use_container_width=use_container_width, hide_index=hide_index)
+
+
+def _decision_file_date(path: str):
+    stem = Path(path).stem
+    if not stem.startswith("decisions_"):
+        return None
+    day_str = stem[len("decisions_") :]
+    try:
+        return datetime.strptime(day_str, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _iter_jsonl_lines_reverse(path: str, block_size: int = 1024 * 1024):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            position = fh.tell()
+            pending = b""
+            while position > 0:
+                read_size = block_size if position >= block_size else position
+                position -= read_size
+                fh.seek(position)
+                chunk = fh.read(read_size)
+                parts = (chunk + pending).split(b"\n")
+                pending = parts[0]
+                for raw in reversed(parts[1:]):
+                    yield raw.decode("utf-8", errors="ignore")
+            if pending:
+                yield pending.decode("utf-8", errors="ignore")
+    except OSError:
+        return
+
+
+def _parse_timestamp_utc(raw_ts) -> datetime | None:
+    if raw_ts is None:
+        return None
+    text = str(raw_ts).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def load_decisions(days: int = 7, max_lines: int | None = None) -> pd.DataFrame:
+    files = sorted(glob.glob(str(AUDIT_DIR / "decisions_*.jsonl")))
+    safe_days = max(1, int(days))
+    cutoff_date = (datetime.now(timezone.utc) - pd.Timedelta(days=safe_days - 1)).date()
+    cutoff_ts = datetime.now(timezone.utc) - pd.Timedelta(days=safe_days)
+    safe_max_lines = DECISION_MAX_LINES if max_lines is None else max(10_000, min(int(max_lines), 1_000_000))
+    selected_files = []
+    for path in files:
+        file_day = _decision_file_date(path)
+        # Keep unknown filenames to avoid accidental drops when rotation format changes.
+        if file_day is None or file_day >= cutoff_date:
+            selected_files.append(path)
+
+    rows = []
+    lines_read = 0
+    reached_cutoff = False
+    for path in reversed(selected_files):
+        for line in _iter_jsonl_lines_reverse(path):
+            if lines_read >= safe_max_lines:
+                reached_cutoff = True
+                break
+            line = line.strip()
+            if not line:
+                continue
+            lines_read += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = _parse_timestamp_utc(row.get("timestamp"))
+            if ts is not None and ts < cutoff_ts:
+                reached_cutoff = True
+                break
+            rows.append(row)
+        if reached_cutoff:
+            break
 
     if not rows:
         return pd.DataFrame()
@@ -285,6 +482,10 @@ def load_decisions(days: int = 7) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    if "action" in df.columns:
+        # Normalize historical log variants (case/whitespace) so counters stay accurate.
+        action_norm = df["action"].where(df["action"].notna(), "")
+        df["action"] = action_norm.astype(str).str.strip().str.upper()
     if "simulation" in df.columns:
         sim = df["simulation"].apply(lambda x: x if isinstance(x, dict) else {})
         for key in (
@@ -356,7 +557,7 @@ def load_positions_summary(user_address: str, limit: int = 500, max_pages: int =
             method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=DASHBOARD_HTTP_TIMEOUT_SEC) as resp:
                 if resp.status != 200:
                     return {
                         "fetched": False,
@@ -426,7 +627,7 @@ def load_unsettled_value(user_address: str) -> dict:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=DASHBOARD_HTTP_TIMEOUT_SEC) as resp:
             if resp.status != 200:
                 return {"fetched": False, "error": f"http_{resp.status}"}
             payload = json.loads(resp.read().decode("utf-8"))
@@ -477,7 +678,7 @@ def load_exchange_activity_summary(
             method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=DASHBOARD_HTTP_TIMEOUT_SEC) as resp:
                 if resp.status != 200:
                     return {"fetched": False, "error": f"http_{resp.status}"}
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -504,11 +705,16 @@ def load_exchange_activity_summary(
     now_utc = datetime.now(timezone.utc)
     cutoff_24h = now_utc - pd.Timedelta(hours=max(1, int(lookback_hours)))
     session_cutoff = None
+    session_cutoff_source = "session_start"
     if session_start_epoch is not None:
         try:
             session_cutoff = datetime.fromtimestamp(float(session_start_epoch), tz=timezone.utc)
         except Exception:
             session_cutoff = None
+    if session_cutoff is None:
+        # Bound session metrics to lookback window when bot start is unavailable.
+        session_cutoff = cutoff_24h
+        session_cutoff_source = "lookback_fallback"
 
     fills_24h = 0
     fills_session = 0
@@ -532,7 +738,7 @@ def load_exchange_activity_summary(
             fill_volume_usd_24h += amt_usd
             if sport:
                 fills_by_sport_24h[sport] = fills_by_sport_24h.get(sport, 0) + 1
-        if session_cutoff is None or ts >= session_cutoff:
+        if ts >= session_cutoff:
             fills_session += 1
             fill_volume_usd_session += amt_usd
             if sport:
@@ -548,6 +754,7 @@ def load_exchange_activity_summary(
         "fill_volume_usd_session": round(fill_volume_usd_session, 2),
         "fills_by_sport_24h": fills_by_sport_24h,
         "fills_by_sport_session": fills_by_sport_session,
+        "session_cutoff_source": session_cutoff_source,
     }
 
 
@@ -595,8 +802,19 @@ def deactivate_killswitch():
 
 def check_password() -> bool:
     pw = os.getenv("DASHBOARD_PASSWORD", "").strip() or _read_env_value("DASHBOARD_PASSWORD")
+    allow_no_password = os.getenv("DASHBOARD_ALLOW_NO_PASSWORD", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     if not pw:
-        return True
+        if allow_no_password:
+            st.warning("Dashboard auth disabled via `DASHBOARD_ALLOW_NO_PASSWORD=1`.")
+            return True
+        st.error("`DASHBOARD_PASSWORD` is not set. Refusing to run unsecured dashboard controls.")
+        st.caption("Set `DASHBOARD_PASSWORD` in config/env.")
+        return False
     if st.session_state.get("authenticated"):
         return True
     with st.form("login"):
@@ -845,7 +1063,7 @@ if not check_password():
 runtime = load_runtime_config()
 health = _read_json(HEALTH_PATH)
 sim_state = _read_json(SIM_STATE_PATH)
-df = load_decisions(days=7)
+df = load_decisions(days=DECISION_LOAD_DAYS)
 recent_df_all = _window_df(df, hours=24)
 session_start_global = pd.to_datetime(health.get("started_at"), utc=True, errors="coerce")
 if pd.notna(session_start_global) and "timestamp" in df.columns:
@@ -855,6 +1073,13 @@ else:
 
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = _query_param_get("auto_refresh", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+if "external_api_enabled" not in st.session_state:
+    st.session_state.external_api_enabled = _query_param_get("external_api", "0").lower() in {
         "1",
         "true",
         "yes",
@@ -918,29 +1143,35 @@ with ctrl_c:
     qp_value = "1" if auto_refresh else "0"
     if _query_param_get("auto_refresh", "0") != qp_value:
         _query_param_set("auto_refresh", qp_value)
+    external_api_enabled = st.checkbox("Live API cards", key="external_api_enabled")
+    external_qp_value = "1" if external_api_enabled else "0"
+    if _query_param_get("external_api", "0") != external_qp_value:
+        _query_param_set("external_api", external_qp_value)
     if auto_refresh:
         st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
 
 tab_overview, tab_decisions, tab_config = st.tabs(["Overview", "Decisions", "Config"])
 
 with tab_overview:
+    external_api_enabled = bool(st.session_state.get("external_api_enabled", False))
     recent_df = recent_df_all.copy()
     session_df = session_df_all.copy()
     session_start = session_start_global
     configured_sports = [str(s).strip() for s in sports_active if str(s).strip()]
-    total_7d = len(df)
+    total_window = len(df)
+    window_label = f"{DECISION_LOAD_DAYS}d"
     total_24h = len(recent_df)
     total_session = len(session_df)
-    submitted_7d = int(_has_actions(df, ORDER_ACTIONS).sum())
+    submitted_window = int(_has_actions(df, ORDER_ACTIONS).sum())
     submitted_24h = int(_has_actions(recent_df, ORDER_ACTIONS).sum())
     submitted_session = int(_has_actions(session_df, ORDER_ACTIONS).sum())
-    simulated_7d = int(_has_action(df, "SIMULATED").sum())
+    simulated_window = int(_has_action(df, "SIMULATED").sum())
     simulated_24h = int(_has_action(recent_df, "SIMULATED").sum())
     simulated_session = int(_has_action(session_df, "SIMULATED").sum())
-    rejected_7d = int(_has_action(df, "REJECTED").sum())
+    rejected_window = int(_has_action(df, "REJECTED").sum())
     rejected_24h = int(_has_action(recent_df, "REJECTED").sum())
     rejected_session = int(_has_action(session_df, "REJECTED").sum())
-    dry_run_7d = int(_has_action(df, "DRY_RUN").sum())
+    dry_run_window = int(_has_action(df, "DRY_RUN").sum())
     dry_run_24h = int(_has_action(recent_df, "DRY_RUN").sum())
     dry_run_session = int(_has_action(session_df, "DRY_RUN").sum())
     sport_activity_rows: list[dict] = []
@@ -990,9 +1221,12 @@ with tab_overview:
     else:
         avg_sim_bet = 0.0
 
-    start_bankroll = float(sim_state.get("start_bankroll", runtime.get("SIMULATION_START_BANKROLL", 1000)))
-    current_bankroll = float(sim_state.get("current_bankroll", start_bankroll))
-    expected_pnl = float(sim_state.get("expected_pnl", 0.0))
+    start_bankroll = _safe_float(
+        sim_state.get("start_bankroll"),
+        _safe_float(runtime.get("SIMULATION_START_BANKROLL"), 1000.0),
+    )
+    current_bankroll = _safe_float(sim_state.get("current_bankroll"), start_bankroll)
+    expected_pnl = _safe_float(sim_state.get("expected_pnl"), 0.0)
     pnl_pct = (expected_pnl / start_bankroll * 100.0) if start_bankroll > 0 else 0.0
     invested_usd = _to_float_or_none(health.get("invested_usd")) or 0.0
     exchange_open_orders_count = _to_float_or_none(health.get("exchange_open_orders_count"))
@@ -1023,12 +1257,14 @@ with tab_overview:
     open_positions_value_usd = _to_float_or_none(health.get("open_positions_value_usd"))
     open_positions_count_raw = _to_float_or_none(health.get("open_positions_count"))
     needs_positions_fallback = (
+        external_api_enabled
+        and
         not sim_mode
         and bool(portfolio_address)
         and (open_positions_value_usd is None or open_positions_count_raw is None)
     )
     if needs_positions_fallback:
-        positions_summary = load_positions_summary(portfolio_address, limit=200, max_pages=2)
+        positions_summary = load_positions_summary(portfolio_address, limit=100, max_pages=1)
         if open_positions_value_usd is None and positions_summary.get("fetched"):
             open_positions_value_usd = _to_float_or_none(positions_summary.get("open_positions_value_usd"))
         if open_positions_count_raw is None and positions_summary.get("fetched"):
@@ -1039,7 +1275,7 @@ with tab_overview:
         total_equity_usd = wallet_balance_usd + open_positions_value_usd
     unsettled_summary = (
         load_unsettled_value(portfolio_address)
-        if (not sim_mode and portfolio_address)
+        if (external_api_enabled and not sim_mode and portfolio_address)
         else {"fetched": False, "error": "simulation_or_missing_address"}
     )
     unsettled_value_usd = (
@@ -1058,13 +1294,14 @@ with tab_overview:
         else None
     )
     fills_summary = {"fetched": False, "error": "simulation_or_missing_address"}
+    fills_session_cutoff_source = "session_start"
     fills_24h = 0
     fills_session = 0
     fill_volume_usd_24h = 0.0
     fill_volume_usd_session = 0.0
     fills_by_sport_24h: dict[str, int] = {}
     fills_by_sport_session: dict[str, int] = {}
-    if not sim_mode and portfolio_address:
+    if external_api_enabled and not sim_mode and portfolio_address:
         session_start_epoch = (
             float(session_start.timestamp())
             if pd.notna(session_start)
@@ -1074,14 +1311,15 @@ with tab_overview:
             portfolio_address,
             session_start_epoch=session_start_epoch,
             lookback_hours=24,
-            limit=200,
-            max_pages=3,
+            limit=100,
+            max_pages=1,
         )
         if fills_summary.get("fetched"):
             fills_24h = int(fills_summary.get("fills_24h") or 0)
             fills_session = int(fills_summary.get("fills_session") or 0)
-            fill_volume_usd_24h = float(fills_summary.get("fill_volume_usd_24h") or 0.0)
-            fill_volume_usd_session = float(fills_summary.get("fill_volume_usd_session") or 0.0)
+            fill_volume_usd_24h = _safe_float(fills_summary.get("fill_volume_usd_24h"), 0.0)
+            fill_volume_usd_session = _safe_float(fills_summary.get("fill_volume_usd_session"), 0.0)
+            fills_session_cutoff_source = str(fills_summary.get("session_cutoff_source") or "session_start")
             fills_by_sport_24h = (
                 fills_summary.get("fills_by_sport_24h")
                 if isinstance(fills_summary.get("fills_by_sport_24h"), dict)
@@ -1100,23 +1338,27 @@ with tab_overview:
             row["fills_session"] = _sum_by_sport_token(fills_by_sport_session, sport_name)
             row["fills_24h"] = _sum_by_sport_token(fills_by_sport_24h, sport_name)
 
-    if sim_mode and dry_run_7d > 0:
+    if sim_mode and dry_run_window > 0:
         st.caption("`DRY_RUN` rows are signal checks only and are not submitted orders.")
     st.caption("Live cards are bot-scoped: bot-submitted orders and bot-tracked USDC cash, not full Polymarket portfolio P&L.")
     if not sim_mode:
+        if not external_api_enabled:
+            st.caption("Live API cards are paused for faster load. Enable `Live API cards` above.")
         st.caption("Total equity = bot cash + current value of active open positions.")
         st.caption("`Submitted` = bot decision time; `Exchange fills` = actual fill events (can happen later).")
         if not fills_available and portfolio_address:
             st.caption(f"Exchange fills feed unavailable: {fills_summary.get('error', 'unknown_error')}")
         if pd.notna(session_start):
             st.caption(f"Session start: {session_start.strftime('%m-%d %H:%M:%S UTC')}")
+        elif fills_available and fills_session_cutoff_source == "lookback_fallback":
+            st.caption("Session start unavailable; exchange session metrics are using rolling 24h.")
 
     top_a, top_b, top_c, top_d = st.columns(4)
     if sim_mode:
-        top_a.metric("Decisions (24h)", total_24h, f"7d: {total_7d}")
-        top_b.metric("Orders Submitted (24h)", submitted_24h, f"7d: {submitted_7d}")
-        top_c.metric("Simulated (24h)", simulated_24h, f"7d: {simulated_7d}")
-        top_d.metric("Dry-Run Signals (24h)", dry_run_24h, f"7d: {dry_run_7d}")
+        top_a.metric("Decisions (24h)", total_24h, f"{window_label}: {total_window}")
+        top_b.metric("Orders Submitted (24h)", submitted_24h, f"{window_label}: {submitted_window}")
+        top_c.metric("Simulated (24h)", simulated_24h, f"{window_label}: {simulated_window}")
+        top_d.metric("Dry-Run Signals (24h)", dry_run_24h, f"{window_label}: {dry_run_window}")
     else:
         top_a.metric("Decisions (Session)", total_session, f"24h: {total_24h}")
         top_b.metric("Orders Submitted (Session)", submitted_session, f"24h: {submitted_24h}")
@@ -1147,7 +1389,7 @@ with tab_overview:
             ascending=[False, False, False, True],
         )
         with st.expander("Sport Activity (24h + Session)", expanded=True):
-            st.dataframe(activity_df, use_container_width=True, hide_index=True)
+            _safe_dataframe(activity_df, use_container_width=True, hide_index=True)
 
     if not sim_mode:
         odds_games_by_sport = health.get("odds_games_by_sport") if isinstance(health.get("odds_games_by_sport"), dict) else {}
@@ -1180,7 +1422,7 @@ with tab_overview:
                 ascending=[False, False, False, True],
             )
             with st.expander("Live Feed Coverage", expanded=True):
-                st.dataframe(feed_df, use_container_width=True, hide_index=True)
+                _safe_dataframe(feed_df, use_container_width=True, hide_index=True)
                 if aggregated_by_market_type:
                     mt = ", ".join(
                         f"{k}: {int(v)}"
@@ -1202,6 +1444,7 @@ with tab_overview:
                 "dry_run",
                 "skipped_no_agg",
                 "skipped_order_book_fetch",
+                "skipped_segment_market",
                 "skipped_event_started",
                 "skipped_pre_event_window",
                 "skipped_no_edge_or_gates",
@@ -1223,7 +1466,12 @@ with tab_overview:
                 diag_rows.append({"metric": key, "value": value})
             if diag_rows:
                 with st.expander("Last Fast Cycle Diagnostics", expanded=True):
-                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+                    diag_df = pd.DataFrame(diag_rows)
+                    if "value" in diag_df.columns:
+                        diag_df["value"] = diag_df["value"].apply(
+                            lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+                        )
+                    _safe_dataframe(diag_df, use_container_width=True, hide_index=True)
                     if int(fast_cycle.get("submitted", 0) or 0) == 0:
                         blockers = []
                         if int(fast_cycle.get("blocked_circuit_breaker", 0) or 0) > 0:
@@ -1297,7 +1545,7 @@ with tab_overview:
     if df.empty:
         st.info("No decision data yet. Let the bot run for a few cycles.")
     else:
-        chart_scope_options = ["Session", "24h", "7d"]
+        chart_scope_options = ["Session", "24h", "Window"]
         chart_scope_default = 0 if not sim_mode else 1
         chart_scope = st.selectbox(
             "Chart Window",
@@ -1417,11 +1665,12 @@ with tab_decisions:
     else:
         st.caption("`SUBMITTED` means order sent to the exchange, not a guaranteed fill.")
         st.caption("Edge breakdown uses devigged consensus probability, expected fill probability, and safety haircut.")
+        st.caption(f"Loaded window: last {DECISION_LOAD_DAYS} day(s) for dashboard performance.")
         action_options = ["Executed only", "Submitted only", "Rejected only", "All"]
         if sim_mode:
             action_options.insert(2, "Simulated only")
             action_options.insert(3, "Dry run only")
-        time_options = ["Session only", "Last 24h", "Last 7d"]
+        time_options = ["Session only", "Last 24h", "Loaded window"]
         default_time_idx = 0 if not sim_mode else 1
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -1457,57 +1706,9 @@ with tab_decisions:
         if sport_filter != "All" and "sport" in filtered.columns:
             filtered = filtered[filtered["sport"] == sport_filter].copy()
 
-        if {"buy_outcome", "outcome_a", "outcome_b"}.issubset(filtered.columns):
-            filtered["selected_outcome"] = filtered.apply(
-                lambda row: row["outcome_a"] if row["buy_outcome"] == "a" else row["outcome_b"],
-                axis=1,
-            )
-        elif "buy_outcome" in filtered.columns:
-            filtered["selected_outcome"] = filtered["buy_outcome"].fillna("").astype(str).str.upper()
+        prepared = _prepare_decision_log_df(filtered)
 
-        view = filtered.head(row_count).copy()
-
-        if "true_prob" in view.columns:
-            view["consensus_prob"] = view["true_prob"].apply(_fmt_prob_pct)
-            view["consensus_odds"] = view["true_prob"].apply(_prob_to_american)
-        if {"agg_prob_a", "agg_prob_b"}.issubset(view.columns):
-            view["agg_market"] = view.apply(
-                lambda row: f"A {row['agg_prob_a'] * 100:.1f}% vs B {row['agg_prob_b'] * 100:.1f}%"
-                if pd.notna(row["agg_prob_a"]) and pd.notna(row["agg_prob_b"])
-                else "—",
-                axis=1,
-            )
-        if "poly_fill" in view.columns:
-            view["poly_fill_prob"] = view["poly_fill"].apply(_fmt_prob_pct)
-        if "adjusted_edge" in view.columns:
-            view["edge_pp"] = (view["adjusted_edge"] * 100).round(2).astype(str) + "pp"
-        if {"raw_edge", "adjusted_edge", "true_prob", "poly_fill"}.issubset(view.columns):
-            view["edge_breakdown"] = [_edge_breakdown_text(row) for _, row in view.iterrows()]
-
-        cols = [
-            "timestamp",
-            "action",
-            "event",
-            "sport",
-            "market_type",
-            "selected_outcome",
-            "edge_breakdown",
-            "reject_reason",
-            "consensus_prob",
-            "consensus_odds",
-            "poly_fill_prob",
-            "edge_pp",
-            "books_used",
-            "bet_usd",
-            "condition_id",
-            "agg_market",
-            "market_question",
-            "event_start",
-            "sim_expected_pnl_usd",
-            "sim_bankroll_after_usd",
-        ]
-        cols = [c for c in cols if c in view.columns]
-        view = view[cols].copy()
+        view = prepared.head(row_count).copy()
 
         if "timestamp" in view.columns:
             view["timestamp"] = view["timestamp"].dt.strftime("%m-%d %H:%M:%S")
@@ -1521,7 +1722,51 @@ with tab_decisions:
             event_start = pd.to_datetime(view["event_start"], utc=True, errors="coerce")
             view["event_start"] = event_start.dt.strftime("%m-%d %H:%M:%S")
 
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        _safe_dataframe(view, use_container_width=True, hide_index=True)
+
+        st.caption("Excel export always contains the last 24h of decisions, independent of table filters.")
+        export_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if st.button("Prepare Excel export (24h)", key="prepare_decision_log_export"):
+            with st.spinner("Preparing export..."):
+                export_df = _prepare_decision_log_df(recent_df_all.copy())
+                if "timestamp" in export_df.columns:
+                    ts_export = pd.to_datetime(export_df["timestamp"], utc=True, errors="coerce")
+                    export_df["timestamp"] = ts_export.dt.strftime("%Y-%m-%d %H:%M:%S")
+                if "event_start" in export_df.columns:
+                    start_export = pd.to_datetime(export_df["event_start"], utc=True, errors="coerce")
+                    export_df["event_start"] = start_export.dt.strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["decision_export_csv_bytes"] = export_df.to_csv(index=False).encode("utf-8")
+                st.session_state["decision_export_csv_name"] = f"decision_log_24h_{export_ts}.csv"
+                try:
+                    st.session_state["decision_export_excel_bytes"] = _to_excel_bytes(export_df)
+                    st.session_state["decision_export_excel_name"] = f"decision_log_24h_{export_ts}.xlsx"
+                    st.session_state["decision_export_excel_error"] = ""
+                except Exception as exc:
+                    st.session_state["decision_export_excel_bytes"] = b""
+                    st.session_state["decision_export_excel_name"] = f"decision_log_24h_{export_ts}.xlsx"
+                    st.session_state["decision_export_excel_error"] = str(exc)
+
+        csv_bytes = st.session_state.get("decision_export_csv_bytes")
+        if csv_bytes:
+            st.download_button(
+                "Download CSV (24h)",
+                data=csv_bytes,
+                file_name=st.session_state.get("decision_export_csv_name", f"decision_log_24h_{export_ts}.csv"),
+                mime="text/csv",
+                key="decision_log_csv_export",
+            )
+
+        excel_bytes = st.session_state.get("decision_export_excel_bytes")
+        if excel_bytes:
+            st.download_button(
+                "Download Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=st.session_state.get("decision_export_excel_name", f"decision_log_24h_{export_ts}.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="decision_log_excel_export",
+            )
+        elif st.session_state.get("decision_export_excel_error"):
+            st.warning("Excel export unavailable right now. CSV fallback is available.")
 
 with tab_config:
     st.subheader("Runtime Configuration")
@@ -1545,7 +1790,7 @@ with tab_config:
                 "Simulation Starting Bankroll",
                 min_value=100.0,
                 max_value=1_000_000.0,
-                value=float(current.get("SIMULATION_START_BANKROLL", 1000.0)),
+                value=_clamp(_safe_float(current.get("SIMULATION_START_BANKROLL"), 1000.0), 100.0, 1_000_000.0),
                 step=100.0,
             )
 
@@ -1555,7 +1800,7 @@ with tab_config:
                 "Min Edge (pp)",
                 min_value=0.001,
                 max_value=0.50,
-                value=float(current.get("MIN_EDGE_PP", 0.05)),
+                value=_clamp(_safe_float(current.get("MIN_EDGE_PP"), 0.0085), 0.001, 0.50),
                 step=0.001,
                 format="%.3f",
             )
@@ -1563,7 +1808,7 @@ with tab_config:
                 "Spread Aggressiveness (max spread)",
                 min_value=0.001,
                 max_value=0.100,
-                value=float(current.get("MAX_SPREAD", 0.01)),
+                value=_clamp(_safe_float(current.get("MAX_SPREAD"), 0.01), 0.001, 0.100),
                 step=0.001,
                 format="%.3f",
                 help="Higher value is more aggressive: allows wider books.",
@@ -1572,9 +1817,22 @@ with tab_config:
                 "Fraction Kelly",
                 min_value=0.01,
                 max_value=1.0,
-                value=float(current.get("FRACTION_KELLY", 0.15)),
+                value=_clamp(_safe_float(current.get("FRACTION_KELLY"), 0.15), 0.01, 1.0),
                 step=0.01,
                 format="%.2f",
+            )
+            event_cap_kelly_multiplier = st.number_input(
+                "Event Cap Kelly Multiplier",
+                min_value=1.0,
+                max_value=5.0,
+                value=_clamp(
+                    _safe_float(current.get("EVENT_CAP_KELLY_MULTIPLIER"), 3.0),
+                    1.0,
+                    5.0,
+                ),
+                step=0.1,
+                format="%.1f",
+                help="How many Kelly-sized entries the bot may hold per event before hitting the event cap.",
             )
             moneyline_favorites_only = st.checkbox(
                 "Moneyline: favorites only",
@@ -1608,7 +1866,7 @@ with tab_config:
                 "Max Per Event %",
                 min_value=0.005,
                 max_value=0.50,
-                value=float(current.get("MAX_PER_EVENT_PCT", 0.02)),
+                value=_clamp(_safe_float(current.get("MAX_PER_EVENT_PCT"), 0.02), 0.005, 0.50),
                 step=0.005,
                 format="%.3f",
             )
@@ -1616,7 +1874,7 @@ with tab_config:
                 "Max Total Exposure %",
                 min_value=0.05,
                 max_value=1.0,
-                value=float(current.get("MAX_TOTAL_EXPOSURE_PCT", 0.30)),
+                value=_clamp(_safe_float(current.get("MAX_TOTAL_EXPOSURE_PCT"), 0.30), 0.05, 1.0),
                 step=0.01,
                 format="%.2f",
             )
@@ -1638,6 +1896,7 @@ with tab_config:
                     "MIN_EDGE_PP": min_edge,
                     "MAX_SPREAD": max_spread,
                     "FRACTION_KELLY": fraction_kelly,
+                    "EVENT_CAP_KELLY_MULTIPLIER": event_cap_kelly_multiplier,
                     "MONEYLINE_FAVORITES_ONLY": moneyline_favorites_only,
                     "NO_RESTING_ORDERS": no_resting_orders,
                     "MAX_PER_EVENT_PCT": max_per_event,
@@ -1654,7 +1913,7 @@ with tab_config:
 
     st.subheader("Quick Kelly Controls")
     current_runtime = load_runtime_config()
-    current_kelly = float(current_runtime.get("FRACTION_KELLY", 0.15))
+    current_kelly = _clamp(_safe_float(current_runtime.get("FRACTION_KELLY"), 0.15), 0.01, 1.0)
     k1, k2, k3 = st.columns([1, 1, 2])
     with k1:
         if st.button("Kelly -0.01", use_container_width=True):
@@ -1675,7 +1934,7 @@ with tab_config:
     with r1:
         if sim_mode:
             if st.button("Reset Paper Bankroll", use_container_width=True):
-                start = float(load_runtime_config().get("SIMULATION_START_BANKROLL", 1000.0))
+                start = _safe_float(load_runtime_config().get("SIMULATION_START_BANKROLL"), 1000.0)
                 reset_simulation_state(start)
                 st.success("Simulation bankroll reset.")
         else:

@@ -3,6 +3,7 @@ import json
 import logging
 import signal
 from collections import Counter
+import re
 from dotenv import load_dotenv
 from polyedge.config import EdgeConfig
 from polyedge.data.odds_api import fetch_all_odds
@@ -16,7 +17,7 @@ from polyedge.pipeline.matcher import (
     spread_points_compatible,
 )
 from polyedge.pipeline.edge_detector import detect_edge
-from polyedge.execution.sizing import compute_bet_size
+from polyedge.execution.sizing import compute_bet_size, compute_event_cap_pct
 from polyedge.execution.executor import EdgeExecutor
 from polyedge.execution.redeemer import AutoRedeemer
 from polyedge.execution.order_manager import OrderManager
@@ -25,7 +26,7 @@ from polyedge.risk.circuit_breaker import CircuitBreaker
 from polyedge.monitoring import audit_log
 from polyedge.models import BookLine
 from polyedge.simulation import PaperSimulator
-from polyedge.paths import KILLSWITCH_PATH, CONFIG_ENV_PATH, HEALTH_PATH
+from polyedge.paths import KILLSWITCH_PATH, CONFIG_ENV_PATH, HEALTH_PATH, EXPOSURE_STATE_PATH
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -39,6 +40,172 @@ def _to_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_risk_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _event_risk_id(matched) -> str:
+    sport = _normalize_risk_token(getattr(matched, "sport", ""))
+    kickoff = str(
+        getattr(matched.all_odds, "commence_time", "")
+        or getattr(matched.poly_market, "start_iso", "")
+    ).strip().lower()
+    team_tokens = sorted(
+        token
+        for token in (
+            _normalize_risk_token(getattr(matched, "team_a", "")),
+            _normalize_risk_token(getattr(matched, "team_b", "")),
+        )
+        if token
+    )
+    if sport and kickoff and len(team_tokens) == 2:
+        return f"{sport}|{kickoff}|{team_tokens[0]}|{team_tokens[1]}"
+
+    fallback = str(getattr(matched.poly_market, "condition_id", "")).strip()
+    if fallback:
+        return fallback
+    event_title = _normalize_risk_token(getattr(matched.poly_market, "event_title", ""))
+    return f"{sport}|{event_title}" if sport or event_title else "unknown_event"
+
+
+_INTRA_MARKET_HINTS = (
+    "first half",
+    "1st half",
+    "second half",
+    "2nd half",
+    "first quarter",
+    "1st quarter",
+    "second quarter",
+    "2nd quarter",
+    "third quarter",
+    "3rd quarter",
+    "fourth quarter",
+    "4th quarter",
+    "first period",
+    "1st period",
+    "second period",
+    "2nd period",
+    "third period",
+    "3rd period",
+    "regulation winner",
+    "in regulation",
+    "after 60",
+    "60-minute",
+    "60 minute",
+    "60 min",
+    "period winner",
+    "set winner",
+)
+_INTRA_SHORT_RE = re.compile(
+    r"\b(?:1h|2h|h1|h2|"
+    r"1q|2q|3q|4q|q1|q2|q3|q4|"
+    r"1p|2p|3p|p1|p2|p3)\b"
+)
+_INTRA_SEGMENT_RE = re.compile(
+    r"\b(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth)\s+"
+    r"(?:set|period|quarter|half|inning|map|game)\b"
+)
+_TENNIS_MAJOR_KEYWORDS = (
+    "australian open",
+    "french open",
+    "roland garros",
+    "wimbledon",
+    "us open",
+    "indian wells",
+    "miami open",
+    "madrid open",
+    "italian open",
+    "rome masters",
+    "canadian open",
+    "cincinnati open",
+    "shanghai masters",
+    "paris masters",
+    "atp finals",
+    "wta finals",
+    "davis cup",
+    "billie jean king cup",
+    "united cup",
+    "laver cup",
+)
+_TENNIS_MAJOR_SPORT_TOKENS = (
+    "australian_open",
+    "french_open",
+    "wimbledon",
+    "us_open",
+    "indian_wells",
+    "miami_open",
+    "madrid_open",
+    "italian_open",
+    "canadian_open",
+    "cincinnati_open",
+    "shanghai",
+    "paris_masters",
+    "atp_finals",
+    "wta_finals",
+    "davis_cup",
+    "billie_jean_king_cup",
+    "united_cup",
+    "laver_cup",
+)
+_TENNIS_EXCLUDED_KEYWORDS = (
+    "qualification",
+    "qualifying",
+    "challenger",
+    "itf",
+    "futures",
+    "atp 125",
+    "wta 125",
+)
+
+
+def _is_intra_game_market(matched) -> bool:
+    market = getattr(matched, "poly_market", None)
+    if market is None:
+        return False
+    texts = [
+        str(getattr(market, "event_title", "") or ""),
+        str(getattr(market, "question", "") or ""),
+        str(getattr(market, "outcome_a", "") or ""),
+        str(getattr(market, "outcome_b", "") or ""),
+    ]
+    for text in texts:
+        t = text.strip().lower()
+        if not t:
+            continue
+        if any(hint in t for hint in _INTRA_MARKET_HINTS):
+            return True
+        if _INTRA_SHORT_RE.search(t):
+            return True
+        if _INTRA_SEGMENT_RE.search(t):
+            return True
+    return False
+
+
+def _passes_tennis_scope(matched, tennis_major_only: bool) -> bool:
+    if not tennis_major_only:
+        return True
+
+    sport_key = str(getattr(matched.all_odds, "sport", "") or "").strip().lower()
+    if not sport_key.startswith("tennis_"):
+        return True
+
+    text_parts = [
+        str(getattr(matched.poly_market, "event_title", "") or ""),
+        str(getattr(matched.poly_market, "question", "") or ""),
+        str(getattr(matched.poly_market, "outcome_a", "") or ""),
+        str(getattr(matched.poly_market, "outcome_b", "") or ""),
+    ]
+    haystack = " ".join(t.strip().lower() for t in text_parts if t)
+
+    if any(keyword in haystack for keyword in _TENNIS_EXCLUDED_KEYWORDS):
+        return False
+    if any(token in sport_key for token in _TENNIS_MAJOR_SPORT_TOKENS):
+        return True
+    if any(keyword in haystack for keyword in _TENNIS_MAJOR_KEYWORDS):
+        return True
+    return False
 
 
 def summarize_exchange_open_orders(raw_orders) -> tuple[int, float]:
@@ -92,7 +259,9 @@ class PolyEdgeBot:
         self.odds_cache = TTLCache(ttl_sec=self.cfg.poll_interval_sec * self.cfg.slow_cycle_multiplier)
         self.market_cache = TTLCache(ttl_sec=self.cfg.poll_interval_sec * self.cfg.slow_cycle_multiplier)
         self.match_cache = TTLCache(ttl_sec=self.cfg.poll_interval_sec * self.cfg.slow_cycle_multiplier)
-        self.exposure = ExposureTracker()
+        self.exposure = ExposureTracker(
+            state_path=EXPOSURE_STATE_PATH if not self.cfg.simulation_mode else None
+        )
         self.breaker = CircuitBreaker()
         self.poly_client = None
         self.executor = None
@@ -122,12 +291,64 @@ class PolyEdgeBot:
         self.last_fast_cycle: dict[str, int | str] = {}
         self._active_sig_type: int | None = None
         self._active_funder: str | None = None
+        self._trading_signer_address: str | None = None
 
     def _is_live_mode(self) -> bool:
         return (
             self.executor is not None
             and self.cfg.trading_enabled
             and not self.cfg.simulation_mode
+        )
+
+    def _build_redeemer(self, funder: str | None) -> AutoRedeemer:
+        claim_holder = str(getattr(self.cfg, "poly_claim_holder_address", "") or "").strip()
+        explicit_claim_user = str(getattr(self.cfg, "poly_claim_user_address", "") or "").strip()
+        claim_user = explicit_claim_user or str(funder or "").strip()
+        try:
+            redeemer = AutoRedeemer(
+                private_key=self.cfg.poly_private_key,
+                holder_address=claim_holder,
+                query_address=claim_user,
+                rpc_url=self.cfg.polygon_rpc,
+                usdc_address=self.cfg.usdc_address,
+                claim_cooldown_sec=self.cfg.claim_cooldown_sec,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Invalid claim identity config (holder=%s user=%s): %s. Falling back to signer defaults.",
+                claim_holder or "empty",
+                claim_user or "empty",
+                exc,
+            )
+            redeemer = AutoRedeemer(
+                private_key=self.cfg.poly_private_key,
+                holder_address="",
+                query_address="",
+                rpc_url=self.cfg.polygon_rpc,
+                usdc_address=self.cfg.usdc_address,
+                claim_cooldown_sec=self.cfg.claim_cooldown_sec,
+            )
+        self._trading_signer_address = getattr(redeemer, "signer_address", "") or None
+        return redeemer
+
+    def _log_identity_state(self, sig_type: int | None, funder: str | None):
+        trade_signer = self._trading_signer_address or ""
+        trading_address = funder or trade_signer
+        claim_signer = getattr(self.redeemer, "signer_address", "") if self.redeemer else ""
+        claim_holder = getattr(self.redeemer, "holder_address", "") if self.redeemer else ""
+        claim_user = getattr(self.redeemer, "query_address", "") if self.redeemer else ""
+        claim_enabled = bool(self.redeemer and self.redeemer.enabled)
+        logger.info(
+            "Identities: trading(sig_type=%s signer=%s funder=%s active=%s) "
+            "claim(signer=%s holder=%s user=%s redeem_enabled=%s)",
+            sig_type,
+            trade_signer or "n/a",
+            funder or "none",
+            trading_address or "n/a",
+            claim_signer or "n/a",
+            claim_holder or "n/a",
+            claim_user or "n/a",
+            claim_enabled,
         )
 
     def _init_poly_client(self):
@@ -138,6 +359,9 @@ class PolyEdgeBot:
             self.executor = None
             self.order_mgr = None
             self.redeemer = None
+            self._active_sig_type = None
+            self._active_funder = None
+            self._trading_signer_address = None
             return
         if not self.cfg.poly_private_key:
             logger.warning("No POLY_PRIVATE_KEY set — running in dry-run mode")
@@ -163,17 +387,14 @@ class PolyEdgeBot:
             self._active_funder = funder
             self.executor = EdgeExecutor(self.poly_client)
             self.order_mgr = OrderManager(self.poly_client)
-            holder = self.cfg.poly_funder_address or ""
-            self.redeemer = AutoRedeemer(
-                private_key=self.cfg.poly_private_key,
-                holder_address=holder,
-                rpc_url=self.cfg.polygon_rpc,
-                usdc_address=self.cfg.usdc_address,
-                claim_cooldown_sec=self.cfg.claim_cooldown_sec,
-            )
+            self.redeemer = self._build_redeemer(funder)
             if self.cfg.auto_claim_enabled:
                 if self.redeemer.enabled:
-                    logger.info("Auto-claim enabled (holder=%s)", self.redeemer.holder_address)
+                    logger.info(
+                        "Auto-claim enabled (holder=%s user=%s)",
+                        self.redeemer.holder_address,
+                        getattr(self.redeemer, "query_address", ""),
+                    )
                 else:
                     logger.warning("Auto-claim disabled: %s", self.redeemer.disable_reason)
             else:
@@ -183,6 +404,7 @@ class PolyEdgeBot:
                 sig_type,
                 funder,
             )
+            self._log_identity_state(sig_type, funder)
         except Exception as e:
             logger.error("CLOB client init failed: %s — continuing in dry-run mode", e)
             self.poly_client = None
@@ -191,6 +413,7 @@ class PolyEdgeBot:
             self.redeemer = None
             self._active_sig_type = None
             self._active_funder = None
+            self._trading_signer_address = None
 
     def _write_health(self, status: str, last_error: str = "") -> None:
         """Persist lightweight bot health status for external checks."""
@@ -244,6 +467,23 @@ class PolyEdgeBot:
                 "last_fast_cycle": self.last_fast_cycle,
                 "active_sig_type": self._active_sig_type,
                 "active_funder": self._active_funder,
+                "trading_sig_type": self._active_sig_type,
+                "trading_signer": self._trading_signer_address,
+                "trading_funder": self._active_funder,
+                "trading_address": self._active_funder or self._trading_signer_address,
+                "claim_signer": (
+                    getattr(self.redeemer, "signer_address", "") if self.redeemer else ""
+                ),
+                "claim_holder": (
+                    getattr(self.redeemer, "holder_address", "") if self.redeemer else ""
+                ),
+                "claim_user": (
+                    getattr(self.redeemer, "query_address", "") if self.redeemer else ""
+                ),
+                "claim_redeem_enabled": bool(self.redeemer and self.redeemer.enabled),
+                "claim_disable_reason": (
+                    getattr(self.redeemer, "disable_reason", "") if self.redeemer else ""
+                ),
             }
             if exchange_open_orders_count is not None:
                 payload["exchange_open_orders_count"] = int(exchange_open_orders_count)
@@ -291,7 +531,106 @@ class PolyEdgeBot:
         except Exception as e:
             logger.warning("Failed to write health status: %s", e)
 
-    def _claim_winning_positions(self):
+    @staticmethod
+    def _cashout_limit_price(cur_price: float, tick: float, min_limit: float) -> float:
+        safe_tick = tick if tick > 0 else 0.01
+        clob_max = round(max(0.01, 1.0 - safe_tick), 4)
+        candidate = round(cur_price - safe_tick, 4)
+        if clob_max < min_limit:
+            return clob_max
+        return round(max(min_limit, min(candidate, clob_max)), 4)
+
+    def _cashout_winning_positions(self):
+        if not self._is_live_mode():
+            return
+        if not bool(getattr(self.cfg, "auto_cashout_enabled", True)):
+            return
+        if self.redeemer is None or self.executor is None:
+            return
+
+        max_cashouts = max(1, int(getattr(self.cfg, "cashout_max_per_cycle", 1)))
+        min_price = float(getattr(self.cfg, "cashout_min_price", 0.99))
+        min_limit = float(getattr(self.cfg, "cashout_min_limit_price", 0.98))
+        min_size = float(getattr(self.cfg, "cashout_min_size", 1.0))
+        min_notional_usd = float(getattr(self.cfg, "cashout_min_notional_usd", 100.0))
+        base_cooldown = max(30, int(getattr(self.cfg, "cashout_cooldown_sec", 3600)))
+
+        attempts = 0
+        positions = self.redeemer.fetch_positions(limit=500, max_pages=3, redeemable_only=False)
+        for pos in positions:
+            if attempts >= max_cashouts:
+                break
+
+            token_id = str(pos.get("asset") or "").strip()
+            if not token_id:
+                continue
+            cashout_key = f"cashout:{token_id}"
+            if self.redeemer.in_cooldown(cashout_key):
+                continue
+
+            size = _to_float(pos.get("size")) or 0.0
+            cur_price = _to_float(pos.get("curPrice")) or 0.0
+            if size <= 0 or cur_price < min_price:
+                continue
+            if bool(pos.get("resolved")) or bool(pos.get("redeemable")):
+                continue
+            if size < min_size:
+                self.redeemer.set_cooldown(cashout_key, max(base_cooldown, 6 * 3600))
+                continue
+            if (size * cur_price) < min_notional_usd:
+                continue
+
+            tick = 0.01
+            if self.poly_client is not None:
+                try:
+                    tick = float(self.poly_client.get_tick_size(token_id) or 0.01)
+                except Exception:
+                    tick = 0.01
+            limit_price = self._cashout_limit_price(cur_price, tick, min_limit)
+            if limit_price < min_limit:
+                continue
+
+            attempts += 1
+            result = self.executor.place_cashout_order(
+                token_id=token_id,
+                size=size,
+                price=limit_price,
+            )
+            if result.get("ok"):
+                est_payout = round(float(size) * float(limit_price), 2)
+                self.redeemer.set_cooldown(cashout_key, base_cooldown)
+                logger.info(
+                    "AUTO-CASHOUT SUBMITTED token=%s condition=%s size=%.4f price=%.4f est=$%.2f order=%s",
+                    token_id,
+                    str(pos.get("conditionId") or "")[:18],
+                    size,
+                    limit_price,
+                    est_payout,
+                    result.get("order_id", ""),
+                )
+                break
+
+            err = str(result.get("error") or "")
+            lower_err = err.lower()
+            cooldown = base_cooldown
+            if "orderbook does not exist" in lower_err:
+                cooldown = 86400 * 7
+            elif "crosses book" in lower_err:
+                cooldown = 60
+            elif ("min:" in lower_err and "max:" in lower_err) or "price" in lower_err:
+                cooldown = 60
+            elif "rate limit" in lower_err or "429" in lower_err or "too many" in lower_err:
+                cooldown = 120
+            self.redeemer.set_cooldown(cashout_key, cooldown)
+            logger.warning(
+                "AUTO-CASHOUT FAILED token=%s condition=%s error=%s",
+                token_id,
+                str(pos.get("conditionId") or "")[:18],
+                err,
+            )
+            break
+
+    def _redeem_winning_positions(self):
         if not self._is_live_mode():
             return
         if not self.cfg.auto_claim_enabled:
@@ -310,7 +649,8 @@ class PolyEdgeBot:
             token_id = str(pos.get("asset") or "")
             if not token_id:
                 continue
-            if self.redeemer.in_cooldown(token_id):
+            claim_key = f"claim:{token_id}"
+            if self.redeemer.in_cooldown(claim_key):
                 continue
             attempts += 1
             result = self.redeemer.redeem_position(pos)
@@ -318,7 +658,7 @@ class PolyEdgeBot:
                 payout = _to_float(result.get("payout_usdc")) or 0.0
                 self.claimed_usdc_today += payout
                 self.claims_today += 1
-                self.redeemer.set_cooldown(token_id, max(3600, int(self.cfg.claim_cooldown_sec)))
+                self.redeemer.set_cooldown(claim_key, max(3600, int(self.cfg.claim_cooldown_sec)))
                 logger.info(
                     "AUTO-CLAIM SUCCESS token=%s condition=%s payout=$%.2f tx=%s",
                     token_id,
@@ -339,8 +679,16 @@ class PolyEdgeBot:
                 cooldown = 86400 * 7
             elif "zero_onchain_balance" in lower_err:
                 cooldown = 86400
-            self.redeemer.set_cooldown(token_id, cooldown)
+            self.redeemer.set_cooldown(claim_key, cooldown)
             logger.warning("AUTO-CLAIM FAILED token=%s error=%s", token_id, err)
+
+    def _claim_winning_positions(self):
+        if not self._is_live_mode():
+            return
+        if self.redeemer is None:
+            return
+        self._cashout_winning_positions()
+        self._redeem_winning_positions()
 
     @staticmethod
     def _install_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -462,14 +810,7 @@ class PolyEdgeBot:
                 self.poly_client = best_client
                 self.executor = EdgeExecutor(self.poly_client)
                 self.order_mgr = OrderManager(self.poly_client)
-                holder = best_funder or ""
-                self.redeemer = AutoRedeemer(
-                    private_key=self.cfg.poly_private_key,
-                    holder_address=holder,
-                    rpc_url=self.cfg.polygon_rpc,
-                    usdc_address=self.cfg.usdc_address,
-                    claim_cooldown_sec=self.cfg.claim_cooldown_sec,
-                )
+                self.redeemer = self._build_redeemer(best_funder)
                 self._active_sig_type = int(best_sig) if best_sig is not None else None
                 self._active_funder = best_funder
                 logger.warning(
@@ -477,6 +818,7 @@ class PolyEdgeBot:
                     self._active_sig_type,
                     self._active_funder,
                 )
+                self._log_identity_state(self._active_sig_type, self._active_funder)
             return best_bal
         except Exception as e:
             logger.error("Bankroll probe failed: %s", e)
@@ -486,7 +828,12 @@ class PolyEdgeBot:
         """Refresh odds, markets, and matching (every ~2 min)."""
         logger.info("SLOW CYCLE: refreshing odds & markets")
 
-        all_odds = await fetch_all_odds(self.cfg.sports, self.cfg.odds_api_key)
+        all_odds = await fetch_all_odds(
+            self.cfg.sports,
+            self.cfg.odds_api_key,
+            self.cfg.odds_api_regions,
+            self.cfg.odds_api_cricket_regions,
+        )
         if all_odds:
             self.odds_cache.set("all_odds", all_odds)
             self.breaker.record_odds_fetch()
@@ -505,13 +852,26 @@ class PolyEdgeBot:
 
         all_odds = self.odds_cache.get("all_odds") or []
         poly_markets = self.market_cache.get("poly_markets") or []
-        matches = match_events(all_odds, poly_markets)
+        matches = match_events(
+            all_odds,
+            poly_markets,
+            # Keep strict MIN_BOOKS enforcement in aggregation only.
+            # Spread pre-filtering at match-time can hide whole sports when
+            # Polymarket is spread-heavy (e.g. soccer), so disable it here.
+            min_books_for_spread=0,
+        )
+        if self.cfg.tennis_major_only:
+            before = len(matches)
+            matches = [m for m in matches if _passes_tennis_scope(m, True)]
+            filtered = before - len(matches)
+            if filtered > 0:
+                logger.info("Filtered %d non-major tennis matches", filtered)
         self.match_cache.set("matches", matches)
         logger.info("Matched %d events", len(matches))
         odds_games_by_sport = Counter(g.sport for g in all_odds)
         matches_by_sport = Counter(m.sport for m in matches)
 
-        def _build_aggregates(min_books: int):
+        def _build_aggregates(min_books: int, soccer_min_books: int):
             cache = {}
             by_sport = Counter()
             by_market_type = Counter()
@@ -533,6 +893,8 @@ class PolyEdgeBot:
                             m.poly_market,
                             team_a_outcome,
                             team_b_outcome,
+                            team_a_name=m.team_a,
+                            team_b_name=m.team_b,
                         ):
                             continue
                     p_a, p_b = devig(
@@ -548,7 +910,12 @@ class PolyEdgeBot:
                             method=self.cfg.devig_method,
                         )
                     )
-                agg = aggregate_probs(lines, min_books=min_books)
+                per_market_min_books = (
+                    soccer_min_books
+                    if str(m.sport).startswith("soccer_")
+                    else min_books
+                )
+                agg = aggregate_probs(lines, min_books=per_market_min_books)
                 if agg:
                     cache[m.poly_market.condition_id] = agg
                     by_sport[m.sport] += 1
@@ -556,26 +923,17 @@ class PolyEdgeBot:
             return cache, by_sport, by_market_type
 
         required_books = max(1, int(self.cfg.min_books))
+        required_soccer_books = max(1, int(self.cfg.soccer_min_books))
         agg_cache, aggregated_by_sport, aggregated_by_market_type = _build_aggregates(
-            required_books
+            required_books,
+            required_soccer_books,
         )
-        # Adaptive fallback: if strict min-book settings yield no markets,
-        # temporarily relax to keep the engine producing decisions.
-        if not agg_cache and matches and required_books > 2:
-            fallback_books = 2
-            fallback_cache, fallback_by_sport, fallback_by_market_type = _build_aggregates(
-                fallback_books
+        if not agg_cache and matches:
+            logger.warning(
+                "No events met thresholds MIN_BOOKS=%d SOCCER_MIN_BOOKS=%d in this cycle",
+                required_books,
+                required_soccer_books,
             )
-            if fallback_cache:
-                logger.warning(
-                    "No events met MIN_BOOKS=%d; temporarily using MIN_BOOKS=%d for this cycle",
-                    required_books,
-                    fallback_books,
-                )
-                self.cfg.min_books = fallback_books
-                agg_cache = fallback_cache
-                aggregated_by_sport = fallback_by_sport
-                aggregated_by_market_type = fallback_by_market_type
         self.odds_cache.set("aggregated", agg_cache)
         self.coverage = {
             "odds_games_by_sport": dict(odds_games_by_sport),
@@ -599,6 +957,7 @@ class PolyEdgeBot:
             "dry_run": 0,
             "skipped_no_agg": 0,
             "skipped_order_book_fetch": 0,
+            "skipped_segment_market": 0,
             "skipped_event_started": 0,
             "skipped_pre_event_window": 0,
             "skipped_no_edge_or_gates": 0,
@@ -618,7 +977,11 @@ class PolyEdgeBot:
             )
             for order in cancelled:
                 if order.amount_usd > 0 and order.sport:
-                    self.exposure.record_exit(order.sport, order.condition_id, order.amount_usd)
+                    self.exposure.record_exit(
+                        order.sport,
+                        order.risk_event_id or order.condition_id,
+                        order.amount_usd,
+                    )
 
         matches = self.match_cache.get("matches")
         if matches is None:
@@ -667,11 +1030,16 @@ class PolyEdgeBot:
 
         for matched in matches:
             cid = matched.poly_market.condition_id
+            risk_event_id = _event_risk_id(matched)
             agg = agg_cache.get(cid)
             if not agg:
                 cycle_stats["skipped_no_agg"] += 1
                 continue
             cycle_stats["with_agg"] += 1
+
+            if _is_intra_game_market(matched):
+                cycle_stats["skipped_segment_market"] += 1
+                continue
 
             try:
                 book_a = await fetch_order_book(matched.poly_market.token_id_a)
@@ -704,7 +1072,39 @@ class PolyEdgeBot:
                     cycle_stats["skipped_pre_event_window"] += 1
                     continue
 
-            opportunities = detect_edge(matched, agg, book_a, book_b, self.cfg, hours_until)
+            edge_result = detect_edge(
+                matched,
+                agg,
+                book_a,
+                book_b,
+                self.cfg,
+                hours_until,
+                include_rejected=True,
+            )
+            if isinstance(edge_result, tuple):
+                opportunities, rejected_edge_candidates = edge_result
+            else:
+                opportunities = edge_result
+                rejected_edge_candidates = []
+
+            for opp in rejected_edge_candidates:
+                if opp.adjusted_edge < self.cfg.min_edge:
+                    reject_reason = (
+                        f"below_min_edge:{opp.adjusted_edge:.4f}<{self.cfg.min_edge:.4f}"
+                    )
+                elif opp.adjusted_edge > self.cfg.max_edge:
+                    reject_reason = (
+                        f"above_max_edge:{opp.adjusted_edge:.4f}>{self.cfg.max_edge:.4f}"
+                    )
+                else:
+                    reject_reason = f"outside_edge_band:{opp.adjusted_edge:.4f}"
+                cycle_stats["rejected"] += 1
+                audit_log.log_decision(
+                    opp,
+                    "REJECTED",
+                    cycle=self.cycle,
+                    meta={"reject_reason": reject_reason},
+                )
             if not opportunities:
                 cycle_stats["skipped_no_edge_or_gates"] += 1
                 continue
@@ -723,6 +1123,15 @@ class PolyEdgeBot:
                     )
                     continue
 
+                event_cap_pct = compute_event_cap_pct(
+                    adjusted_edge=opp.adjusted_edge,
+                    fill_price=opp.poly_fill_price,
+                    fraction_kelly=self.cfg.fraction_kelly,
+                    max_per_event_pct=self.cfg.max_per_event_pct,
+                    event_cap_kelly_multiplier=self.cfg.event_cap_kelly_multiplier,
+                    min_edge=self.cfg.min_edge,
+                )
+                event_exposure = self.exposure.event_exposure(risk_event_id)
                 opp.bet_usd = compute_bet_size(
                     adjusted_edge=opp.adjusted_edge,
                     fill_price=opp.poly_fill_price,
@@ -734,8 +1143,10 @@ class PolyEdgeBot:
                     cash_buffer_pct=self.cfg.cash_buffer_pct,
                     book_depth_usd=opp.poly_depth_shares * opp.poly_fill_price,
                     min_bet=self.cfg.min_bet_usd,
+                    event_exposure=event_exposure,
                     sport_exposure=self.exposure.sport_exposure(opp.matched_event.sport),
                     max_per_sport_pct=self.cfg.max_per_sport_pct,
+                    event_cap_kelly_multiplier=self.cfg.event_cap_kelly_multiplier,
                     min_edge=self.cfg.min_edge,
                 )
                 if opp.bet_usd <= 0:
@@ -745,9 +1156,9 @@ class PolyEdgeBot:
 
                 # Check exposure with actual bet size (not placeholder)
                 if not self.exposure.can_trade(
-                    opp.matched_event.sport, cid, opp.bet_usd,
+                    opp.matched_event.sport, risk_event_id, opp.bet_usd,
                     bankroll=bankroll,
-                    max_per_event=self.cfg.max_per_event_pct,
+                    max_per_event=event_cap_pct,
                     max_per_sport=self.cfg.max_per_sport_pct,
                     max_total=self.cfg.max_total_exposure_pct,
                     daily_loss_limit=self.cfg.daily_loss_limit_pct,
@@ -758,7 +1169,12 @@ class PolyEdgeBot:
                 if self.cfg.simulation_mode:
                     cycle_stats["simulated"] += 1
                     sim = self.simulator.record_bet(opp, cycle=self.cycle)
-                    self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
+                    self.exposure.record_trade(
+                        opp.matched_event.sport,
+                        risk_event_id,
+                        opp.bet_usd,
+                        event_start_ts=event_start_ts,
+                    )
                     self.condition_side_lock[cid] = opp.buy_outcome
                     self.trades_today += 1
                     logger.info(
@@ -779,11 +1195,17 @@ class PolyEdgeBot:
                     if order:
                         order.event_title = matched.poly_market.event_title
                         order.event_start_ts = event_start_ts
+                        order.risk_event_id = risk_event_id
                         if not self.cfg.no_resting_orders and self.order_mgr is not None:
                             self.order_mgr.track(order)
                         # Exposure limits should apply to any successfully submitted live trade,
                         # including no-resting (FOK/IOC-like) executions.
-                        self.exposure.record_trade(opp.matched_event.sport, cid, opp.bet_usd)
+                        self.exposure.record_trade(
+                            opp.matched_event.sport,
+                            risk_event_id,
+                            opp.bet_usd,
+                            event_start_ts=event_start_ts,
+                        )
                         self.condition_side_lock[cid] = opp.buy_outcome
                         self.trades_today += 1
                         cycle_stats["submitted"] += 1
@@ -850,6 +1272,9 @@ class PolyEdgeBot:
                     self.executor = None
                     self.order_mgr = None
                     self.redeemer = None
+                    self._active_sig_type = None
+                    self._active_funder = None
+                    self._trading_signer_address = None
 
                 # Retry CLOB init periodically so transient startup failures can recover.
                 if (not self.cfg.simulation_mode and self.executor is None and self.cfg.poly_private_key and

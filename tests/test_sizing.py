@@ -1,5 +1,5 @@
 import pytest
-from polyedge.execution.sizing import compute_bet_size
+from polyedge.execution.sizing import compute_bet_size, compute_event_cap_pct
 
 class TestSizing:
     def test_basic_kelly(self):
@@ -54,21 +54,95 @@ class TestSizing:
         )
         assert high > low
 
-    def test_event_pct_hard_cap_prevents_oversized_bet(self):
+    def test_event_pct_no_longer_hard_clamped_to_five_percent(self):
         size = compute_bet_size(
             adjusted_edge=0.40, fill_price=0.20, bankroll=1000,
             fraction_kelly=1.0, max_per_event_pct=0.50,
             total_exposure=0, max_total_pct=1.0, cash_buffer_pct=0.0,
             book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+            max_per_sport_pct=1.0,
         )
-        assert size <= 50.0
+        assert size == 150.0
 
-    def test_total_exposure_hard_cap_stops_over_30_percent(self):
+    def test_event_cap_pct_allows_multiple_kelly_units(self):
+        cap_pct = compute_event_cap_pct(
+            adjusted_edge=0.04,
+            fill_price=0.50,
+            fraction_kelly=0.15,
+            max_per_event_pct=0.02,
+            min_edge=0.03,
+        )
+        single_kelly_cap = compute_event_cap_pct(
+            adjusted_edge=0.04,
+            fill_price=0.50,
+            fraction_kelly=0.15,
+            max_per_event_pct=0.02,
+            event_cap_kelly_multiplier=1.0,
+            min_edge=0.03,
+        )
+        assert cap_pct < 0.02
+        assert cap_pct > single_kelly_cap > 0.0
+
+        size = compute_bet_size(
+            adjusted_edge=0.04,
+            fill_price=0.50,
+            bankroll=1000,
+            fraction_kelly=0.15,
+            max_per_event_pct=0.02,
+            total_exposure=0,
+            max_total_pct=0.30,
+            cash_buffer_pct=0.20,
+            book_depth_usd=1000,
+            min_bet=1.0,
+            min_edge=0.03,
+        )
+        assert size == round(1000 * single_kelly_cap, 2)
+
+    def test_event_headroom_allows_multiple_entries_per_event(self):
+        size = compute_bet_size(
+            adjusted_edge=0.04, fill_price=0.50, bankroll=1000,
+            fraction_kelly=0.15, max_per_event_pct=0.02,
+            total_exposure=0, max_total_pct=0.30, cash_buffer_pct=0.20,
+            book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+            event_exposure=8.0,
+        )
+        single_kelly_cap = compute_event_cap_pct(
+            adjusted_edge=0.04,
+            fill_price=0.50,
+            fraction_kelly=0.15,
+            max_per_event_pct=0.02,
+            event_cap_kelly_multiplier=1.0,
+            min_edge=0.03,
+        )
+        assert 1000 * single_kelly_cap < 8.0
+        assert size > 0
+
+    def test_event_headroom_caps_to_remaining(self):
+        size = compute_bet_size(
+            adjusted_edge=0.20, fill_price=0.50, bankroll=1000,
+            fraction_kelly=0.50, max_per_event_pct=0.02,
+            total_exposure=0, max_total_pct=0.30, cash_buffer_pct=0.20,
+            book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+            event_exposure=15.0,
+        )
+        assert size == 5.0
+
+    def test_event_headroom_below_min_bet_returns_zero(self):
+        size = compute_bet_size(
+            adjusted_edge=0.20, fill_price=0.50, bankroll=1000,
+            fraction_kelly=0.50, max_per_event_pct=0.02,
+            total_exposure=0, max_total_pct=0.30, cash_buffer_pct=0.20,
+            book_depth_usd=100000, min_bet=5.0, min_edge=0.03,
+            event_exposure=16.0,
+        )
+        assert size == 0
+
+    def test_total_exposure_no_longer_hard_clamped_to_thirty_percent(self):
         size = compute_bet_size(
             adjusted_edge=0.40, fill_price=0.20, bankroll=1000,
             fraction_kelly=1.0, max_per_event_pct=0.50,
             total_exposure=290.0, max_total_pct=1.0, cash_buffer_pct=0.0,
             book_depth_usd=100000, min_bet=1.0, min_edge=0.03,
+            max_per_sport_pct=1.0,
         )
-        # With a hard 30% total cap on $1,000 bankroll, only $10 headroom remains.
-        assert size <= 10.0
+        assert size == 150.0

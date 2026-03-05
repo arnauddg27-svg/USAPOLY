@@ -44,7 +44,13 @@ if command -v docker >/dev/null 2>&1 \
 else
   echo "[deploy] docker compose dashboard service unavailable; fallback to host python3 -m streamlit"
   pkill -f '[s]treamlit run polyedge/dashboard.py' || true
-  nohup python3 -m streamlit run polyedge/dashboard.py --server.port "${DASHBOARD_PORT:-8502}" > logs/dashboard.out 2>&1 &
+  nohup python3 -m streamlit run polyedge/dashboard.py \
+    --server.port "${DASHBOARD_PORT:-8502}" \
+    --server.address 0.0.0.0 \
+    --server.headless true \
+    --server.enableWebsocketCompression false \
+    --browser.gatherUsageStats false \
+    > logs/dashboard.out 2>&1 &
   sleep 4
   echo "[verify] process:"
   pgrep -af '[s]treamlit run polyedge/dashboard.py' | head -n 1 || echo 'NO_PROCESS'

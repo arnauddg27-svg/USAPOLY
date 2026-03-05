@@ -140,6 +140,7 @@ class OpenOrder:
     order_id: str
     token_id: str
     condition_id: str
+    risk_event_id: str
     sport: str
     side: str
     price: float

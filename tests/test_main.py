@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from polyedge.main import PolyEdgeBot, summarize_exchange_open_orders
+from polyedge.main import PolyEdgeBot, _event_risk_id, summarize_exchange_open_orders
 from polyedge.config import EdgeConfig
 from polyedge.models import (
     AggregatedProb,
@@ -15,6 +15,17 @@ from polyedge.models import (
     PolyMarket,
     SportsOutcome,
 )
+
+
+def test_event_risk_id_groups_markets_for_same_game():
+    game = AllBookOdds("basketball_nba", "Team A", "Team B", "2099-02-02T00:00:00Z", {})
+    market_ml = PolyMarket("Team A vs Team B", "cond-ml", "Team A", "Team B", "tok-a", "tok-b")
+    market_spread = PolyMarket("Team A vs Team B", "cond-spread", "Team A", "Team B", "tok-a2", "tok-b2")
+
+    matched_ml = MatchedEvent("basketball_nba", game, market_ml, "Team A", "Team B")
+    matched_spread = MatchedEvent("basketball_nba", game, market_spread, "Team A", "Team B")
+
+    assert _event_risk_id(matched_ml) == _event_risk_id(matched_spread)
 
 
 def test_fast_cycle_checks_expiry_when_bankroll_unavailable(monkeypatch):
@@ -183,6 +194,7 @@ def test_fast_cycle_no_resting_orders_skips_tracking_but_records_exposure(monkey
     bot.exposure = MagicMock()
     bot.exposure.can_trade.return_value = True
     bot.exposure.total_exposure.return_value = 0.0
+    bot.exposure.event_exposure.return_value = 0.0
     bot.exposure.sport_exposure.return_value = 0.0
     monkeypatch.setattr(bot, "_get_bankroll", lambda: 1000.0)
 
@@ -196,12 +208,61 @@ def test_fast_cycle_no_resting_orders_skips_tracking_but_records_exposure(monkey
 
     bot.executor.place_order.assert_called_once()
     bot.order_mgr.track.assert_not_called()
+    cap_kwargs = bot.exposure.can_trade.call_args.kwargs
+    assert 0 < cap_kwargs["max_per_event"] <= bot.cfg.max_per_event_pct
     bot.exposure.record_trade.assert_called_once()
     args = bot.exposure.record_trade.call_args.args
     assert args[0] == "basketball_nba"
-    assert args[1] == market.condition_id
+    assert args[1] == _event_risk_id(matched)
     assert args[2] > 0
     assert bot.trades_today == 1
+
+
+def test_fast_cycle_skips_halftime_markets(monkeypatch):
+    bot = PolyEdgeBot()
+    bot.cfg.simulation_mode = False
+    bot.cfg.trading_enabled = True
+    bot.cfg.no_resting_orders = True
+    bot.cfg.min_hours_before_event = 0.0
+
+    game = AllBookOdds("basketball_nba", "Raptors", "Wizards", "2099-01-01T00:00:00Z", {})
+    market = PolyMarket(
+        "Raptors vs. Wizards: 1H Moneyline",
+        "cond-1h",
+        "Raptors",
+        "Wizards",
+        "tok-a",
+        "tok-b",
+        question="Raptors vs. Wizards: 1H Moneyline",
+    )
+    matched = MatchedEvent("basketball_nba", game, market, "Raptors", "Wizards")
+    agg = AggregatedProb(0.55, 0.45, 8, 0, "power", [])
+
+    bot.match_cache.set("matches", [matched])
+    bot.odds_cache.set("aggregated", {market.condition_id: agg})
+    bot.order_mgr = MagicMock()
+    bot.executor = MagicMock()
+    bot.poly_client = object()
+    bot.exposure = MagicMock()
+    bot.exposure.total_exposure.return_value = 0.0
+    bot.exposure.event_exposure.return_value = 0.0
+    bot.exposure.sport_exposure.return_value = 0.0
+    monkeypatch.setattr(bot, "_get_bankroll", lambda: 1000.0)
+
+    async def _unexpected_fetch_order_book(_token_id):
+        raise AssertionError("fetch_order_book should not be called for halftime markets")
+
+    monkeypatch.setattr("polyedge.main.fetch_order_book", _unexpected_fetch_order_book)
+    monkeypatch.setattr(
+        "polyedge.main.detect_edge",
+        lambda *_args, **_kwargs: pytest.fail("detect_edge should not be called for halftime markets"),
+    )
+
+    asyncio.run(bot._fast_cycle())
+
+    bot.executor.place_order.assert_not_called()
+    stats = bot.last_fast_cycle
+    assert stats["skipped_segment_market"] == 1
 
 
 def test_slow_cycle_orients_book_outcomes_before_aggregation(monkeypatch):
@@ -233,7 +294,7 @@ def test_slow_cycle_orients_book_outcomes_before_aggregation(monkeypatch):
         sport_tag="nba",
     )
 
-    async def _fake_all_odds(_sports, _api_key):
+    async def _fake_all_odds(_sports, _api_key, *_args, **_kwargs):
         return [game]
 
     async def _fake_polys(_sports):
@@ -281,7 +342,7 @@ def test_slow_cycle_uses_spread_books_for_spread_markets(monkeypatch):
         sport_tag="nba",
     )
 
-    async def _fake_all_odds(_sports, _api_key):
+    async def _fake_all_odds(_sports, _api_key, *_args, **_kwargs):
         return [game]
 
     async def _fake_polys(_sports):
@@ -298,7 +359,7 @@ def test_slow_cycle_uses_spread_books_for_spread_markets(monkeypatch):
     assert agg.books_used == 1
 
 
-def test_slow_cycle_falls_back_to_two_books_when_strict_threshold_empty(monkeypatch):
+def test_slow_cycle_keeps_strict_min_books_when_threshold_empty(monkeypatch):
     bot = PolyEdgeBot()
     bot.cfg.min_books = 6
     bot.cfg.devig_method = "power"
@@ -330,7 +391,7 @@ def test_slow_cycle_falls_back_to_two_books_when_strict_threshold_empty(monkeypa
         sport_tag="nba",
     )
 
-    async def _fake_all_odds(_sports, _api_key):
+    async def _fake_all_odds(_sports, _api_key, *_args, **_kwargs):
         return [game]
 
     async def _fake_polys(_sports):
@@ -343,9 +404,62 @@ def test_slow_cycle_falls_back_to_two_books_when_strict_threshold_empty(monkeypa
 
     agg_cache = bot.odds_cache.get("aggregated") or {}
     agg = agg_cache.get("cond-fallback")
+    assert agg is None
+    assert bot.cfg.min_books == 6
+
+
+def test_slow_cycle_uses_soccer_min_books_override(monkeypatch):
+    bot = PolyEdgeBot()
+    bot.cfg.min_books = 4
+    bot.cfg.soccer_min_books = 3
+    bot.cfg.devig_method = "power"
+
+    game = AllBookOdds(
+        sport="soccer_epl",
+        home="Tottenham Hotspur",
+        away="Crystal Palace",
+        commence_time="2099-01-01T00:00:00Z",
+        books={
+            "BookA": (
+                SportsOutcome("Tottenham Hotspur", -110, "BookA"),
+                SportsOutcome("Crystal Palace", 220, "BookA"),
+            ),
+            "BookB": (
+                SportsOutcome("Tottenham Hotspur", -112, "BookB"),
+                SportsOutcome("Crystal Palace", 225, "BookB"),
+            ),
+            "BookC": (
+                SportsOutcome("Tottenham Hotspur", -108, "BookC"),
+                SportsOutcome("Crystal Palace", 215, "BookC"),
+            ),
+        },
+    )
+    market = PolyMarket(
+        event_title="Tottenham vs Crystal Palace",
+        condition_id="cond-soccer-min-books",
+        outcome_a="Tottenham Hotspur",
+        outcome_b="Crystal Palace",
+        token_id_a="tok-a",
+        token_id_b="tok-b",
+        market_type="moneyline",
+        sport_tag="soccer",
+    )
+
+    async def _fake_all_odds(_sports, _api_key, *_args, **_kwargs):
+        return [game]
+
+    async def _fake_polys(_sports):
+        return [market]
+
+    monkeypatch.setattr("polyedge.main.fetch_all_odds", _fake_all_odds)
+    monkeypatch.setattr("polyedge.main.fetch_sports_markets", _fake_polys)
+
+    asyncio.run(bot._slow_cycle())
+
+    agg_cache = bot.odds_cache.get("aggregated") or {}
+    agg = agg_cache.get("cond-soccer-min-books")
     assert agg is not None
-    assert agg.books_used == 2
-    assert bot.cfg.min_books == 2
+    assert agg.books_used == 3
 
 
 def test_fast_cycle_blocks_opposite_side_for_same_condition(monkeypatch):
@@ -385,6 +499,7 @@ def test_fast_cycle_blocks_opposite_side_for_same_condition(monkeypatch):
     bot.exposure = MagicMock()
     bot.exposure.can_trade.return_value = True
     bot.exposure.total_exposure.return_value = 0.0
+    bot.exposure.event_exposure.return_value = 0.0
     bot.exposure.sport_exposure.return_value = 0.0
     monkeypatch.setattr(bot, "_get_bankroll", lambda: 1000.0)
 
@@ -419,6 +534,7 @@ def test_fast_cycle_skips_started_events(monkeypatch):
     bot.exposure = MagicMock()
     bot.exposure.can_trade.return_value = True
     bot.exposure.total_exposure.return_value = 0.0
+    bot.exposure.event_exposure.return_value = 0.0
     bot.exposure.sport_exposure.return_value = 0.0
     monkeypatch.setattr(bot, "_get_bankroll", lambda: 1000.0)
 
@@ -532,3 +648,146 @@ def test_get_bankroll_probes_and_switches_identity(monkeypatch):
     assert balance == pytest.approx(250.0)
     assert bot._active_sig_type == 2
     assert bot._active_funder == "0xfund"
+
+
+def test_claim_flow_runs_cashout_first_then_redeem(monkeypatch):
+    bot = PolyEdgeBot()
+    bot.cfg.simulation_mode = False
+    bot.cfg.trading_enabled = True
+    bot.cfg.auto_cashout_enabled = True
+    bot.cfg.auto_claim_enabled = True
+    bot.cfg.cashout_min_notional_usd = 0.0
+    bot.executor = MagicMock()
+    bot.poly_client = None
+
+    events: list[tuple[str, str]] = []
+
+    class DummyRedeemer:
+        enabled = True
+        disable_reason = ""
+        signer_address = "0xsigner"
+        holder_address = "0xholder"
+        query_address = "0xquery"
+
+        def __init__(self):
+            self._cooldowns = set()
+
+        def fetch_positions(self, **_kwargs):
+            return [{"asset": "tok-x", "conditionId": "cond-x", "size": 5, "curPrice": 0.992}]
+
+        def fetch_redeemable_positions(self, **_kwargs):
+            # Same token as cashout candidate: redeem path must still run.
+            return [{"asset": "tok-x", "conditionId": "cond-x", "size": 3, "outcomeIndex": 0}]
+
+        def in_cooldown(self, token_id):
+            return str(token_id) in self._cooldowns
+
+        def set_cooldown(self, token_id, _seconds):
+            self._cooldowns.add(str(token_id))
+            events.append(("cooldown", str(token_id)))
+
+        def redeem_position(self, pos):
+            events.append(("redeem", str(pos.get("asset") or "")))
+            return {"ok": True, "payout_usdc": 11.0, "tx_hash": "0xtx"}
+
+    bot.redeemer = DummyRedeemer()
+
+    def _cashout_side_effect(**kwargs):
+        events.append(("cashout", str(kwargs.get("token_id") or "")))
+        return {"ok": False, "error": "orderbook does not exist"}
+
+    bot.executor.place_cashout_order.side_effect = _cashout_side_effect
+
+    bot._claim_winning_positions()
+
+    assert events[0] == ("cashout", "tok-x")
+    assert ("redeem", "tok-x") in events
+    assert ("cooldown", "cashout:tok-x") in events
+    assert ("cooldown", "claim:tok-x") in events
+    assert bot.claims_today == 1
+    assert bot.claimed_usdc_today == pytest.approx(11.0)
+
+
+def test_cashout_limit_price_never_exceeds_clob_max():
+    # tick=0.02 => CLOB max is 0.98; min_limit is above max.
+    # Helper should return clob_max so caller can skip safely.
+    price = PolyEdgeBot._cashout_limit_price(cur_price=0.995, tick=0.02, min_limit=0.99)
+    assert price == pytest.approx(0.98)
+
+
+def test_cashout_skips_positions_below_min_notional():
+    bot = PolyEdgeBot()
+    bot.cfg.simulation_mode = False
+    bot.cfg.trading_enabled = True
+    bot.cfg.auto_cashout_enabled = True
+    bot.cfg.cashout_min_notional_usd = 100.0
+    bot.executor = MagicMock()
+    bot.poly_client = None
+
+    class DummyRedeemer:
+        def fetch_positions(self, **_kwargs):
+            return [{"asset": "tok-low", "conditionId": "cond-low", "size": 40, "curPrice": 0.99}]
+
+        def in_cooldown(self, _token_id):
+            return False
+
+        def set_cooldown(self, _token_id, _seconds):
+            return None
+
+    bot.redeemer = DummyRedeemer()
+
+    bot._cashout_winning_positions()
+
+    bot.executor.place_cashout_order.assert_not_called()
+
+
+def test_init_poly_client_invalid_claim_identity_falls_back(monkeypatch):
+    fake_client_mod = types.ModuleType("py_clob_client.client")
+
+    class FakeClobClient:
+        def __init__(self, _host, key=None, chain_id=None, signature_type=None, funder=None):
+            self.key = key
+            self.chain_id = chain_id
+            self.builder = types.SimpleNamespace(sig_type=signature_type, funder=funder)
+
+        def set_api_creds(self, _creds):
+            return None
+
+        def create_or_derive_api_creds(self):
+            return {}
+
+    fake_client_mod.ClobClient = FakeClobClient
+    fake_constants_mod = types.ModuleType("py_clob_client.constants")
+    fake_constants_mod.POLYGON = 137
+
+    class DummyRedeemer:
+        def __init__(self, *args, **kwargs):
+            holder = kwargs.get("holder_address", "")
+            query = kwargs.get("query_address", "")
+            if holder == "bad-holder" or query == "bad-user":
+                raise ValueError("bad claim identity")
+            self.enabled = True
+            self.disable_reason = ""
+            self.holder_address = holder
+            self.query_address = query
+            self.signer_address = "0xsigner"
+
+    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
+    monkeypatch.setitem(sys.modules, "py_clob_client.constants", fake_constants_mod)
+    monkeypatch.setattr("polyedge.main.AutoRedeemer", DummyRedeemer)
+
+    bot = PolyEdgeBot()
+    bot.cfg.simulation_mode = False
+    bot.cfg.trading_enabled = True
+    bot.cfg.poly_private_key = "0xabc"
+    bot.cfg.poly_signature_type = 2
+    bot.cfg.poly_funder_address = "0xfund"
+    bot.cfg.poly_claim_holder_address = "bad-holder"
+    bot.cfg.poly_claim_user_address = "bad-user"
+
+    bot._init_poly_client()
+
+    assert bot.poly_client is not None
+    assert bot.executor is not None
+    assert bot.order_mgr is not None
+    assert bot.redeemer is not None

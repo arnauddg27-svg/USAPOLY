@@ -178,3 +178,29 @@ class TestExecutor:
         result = executor.place_order(opp, cfg)
         assert result is None
         assert "boom" in executor.last_error
+
+    def test_place_cashout_order_success(self):
+        mock_poly = MagicMock()
+        mock_poly.create_order.return_value = {"signed": True}
+        mock_poly.post_order.return_value = {"orderID": "ord_cashout"}
+        executor = EdgeExecutor(mock_poly)
+
+        result = executor.place_cashout_order(token_id="tok_sell", size=40.0, price=0.99)
+
+        assert result["ok"] is True
+        assert result["order_id"] == "ord_cashout"
+        mock_poly.create_order.assert_called_once()
+        post_kwargs = mock_poly.post_order.call_args.kwargs
+        assert post_kwargs["post_only"] is False
+        assert post_kwargs["orderType"] == "GTC"
+
+    def test_place_cashout_order_rejects_missing_order_id(self):
+        mock_poly = MagicMock()
+        mock_poly.create_order.return_value = {"signed": True}
+        mock_poly.post_order.return_value = {"ok": True}
+        executor = EdgeExecutor(mock_poly)
+
+        result = executor.place_cashout_order(token_id="tok_sell", size=40.0, price=0.99)
+
+        assert result["ok"] is False
+        assert result["error"] == "missing_order_id"

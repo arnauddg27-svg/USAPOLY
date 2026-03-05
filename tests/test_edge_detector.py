@@ -20,14 +20,14 @@ def _book(best_ask=0.55, depth=800):
 
 class TestEdgeDetection:
     def test_positive_edge_detected(self):
-        matched, agg = _matched(0.62)
+        matched, agg = _matched(0.59)
         book_a = _book(0.55, 800)
         cfg = EdgeConfig()
         opps = detect_edge(matched, agg, book_a, _book(0.40, 800), cfg)
         assert len(opps) >= 1
         opp = opps[0]
         assert opp.buy_outcome == "a"
-        assert opp.adjusted_edge > 0.05
+        assert cfg.min_edge <= opp.adjusted_edge <= cfg.max_edge
 
     def test_no_edge(self):
         matched, agg = _matched(0.56)
@@ -36,11 +36,56 @@ class TestEdgeDetection:
         opps = detect_edge(matched, agg, book_a, _book(0.44, 800), cfg)
         assert len(opps) == 0
 
+    def test_include_rejected_returns_below_min_edge_candidates(self):
+        matched, agg = _matched(0.56)
+        book_a = _book(0.55, 800)
+        cfg = EdgeConfig()
+        opps, rejected = detect_edge(
+            matched,
+            agg,
+            book_a,
+            _book(0.44, 800),
+            cfg,
+            include_rejected=True,
+        )
+        assert opps == []
+        assert len(rejected) >= 1
+        assert all(
+            opp.adjusted_edge < cfg.min_edge or opp.adjusted_edge > cfg.max_edge
+            for opp in rejected
+        )
+        assert all(
+            (
+                opp.gate_results.get("edge", {}).get("passed") is False
+                or opp.gate_results.get("edge_ceiling", {}).get("passed") is False
+            )
+            for opp in rejected
+        )
+
+    def test_include_rejected_returns_above_max_edge_candidates(self):
+        matched, agg = _matched(0.70)
+        cfg = EdgeConfig()
+        opps, rejected = detect_edge(
+            matched,
+            agg,
+            _book(0.55, 800),
+            _book(0.40, 800),
+            cfg,
+            include_rejected=True,
+        )
+        assert opps == []
+        assert any(opp.adjusted_edge > cfg.max_edge for opp in rejected)
+        assert any(
+            opp.gate_results.get("edge_ceiling", {}).get("passed") is False
+            for opp in rejected
+        )
+
     def test_both_sides_checked(self):
         matched, agg = _matched(0.40)
         book_a = _book(0.55, 800)
         book_b = _book(0.30, 800)
         cfg = EdgeConfig()
+        cfg.max_edge = 0.50
         opps = detect_edge(matched, agg, book_a, book_b, cfg)
         assert any(o.buy_outcome == "b" for o in opps)
 
@@ -59,8 +104,19 @@ class TestEdgeDetection:
         book_b = _book(0.70, 800)  # no edge on favorite b
         cfg = EdgeConfig()
         cfg.moneyline_favorites_only = False
+        cfg.max_edge = 0.50
         opps = detect_edge(matched, agg, book_a, book_b, cfg)
         assert any(o.buy_outcome == "a" for o in opps)
+
+    def test_moneyline_favorites_only_blocks_sub_50c_favorite_prices(self):
+        matched, agg = _matched(0.60)  # side a is favorite by model/books
+        book_a = _book(0.47, 800)  # favorite priced below 0.50 should be blocked
+        book_b = _book(0.60, 800)
+        cfg = EdgeConfig()
+        cfg.moneyline_favorites_only = True
+        cfg.max_edge = 0.50
+        opps = detect_edge(matched, agg, book_a, book_b, cfg)
+        assert opps == []
 
 class TestGates:
     def test_spread_gate_fails(self):
@@ -81,7 +137,7 @@ class TestGates:
                          asks=[BookLevel(0.55, 800)],
                          bids=[BookLevel(0.545, 500)])
         gates = check_gates(
-            adjusted_edge=0.06, books_used=8, depth=800,
+            adjusted_edge=0.04, books_used=8, depth=800,
             fill_price=0.553, book=book,
             hours_until=5.0, cfg=cfg,
         )

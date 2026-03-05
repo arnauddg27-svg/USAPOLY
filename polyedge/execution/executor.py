@@ -13,6 +13,14 @@ class EdgeExecutor:
         self.poly = poly_client
         self.last_error = ""
 
+    @staticmethod
+    def _extract_order_id(result) -> str:
+        if not isinstance(result, dict):
+            return ""
+        return str(
+            result.get("orderID", result.get("order_id", result.get("orderId", "")))
+        ).strip()
+
     def place_order(self, opp: EdgeOpportunity, cfg: EdgeConfig) -> OpenOrder | None:
         """Build and submit a limit BUY order for the given opportunity.
 
@@ -90,7 +98,7 @@ class EdgeExecutor:
                            opp.buy_token_id, type(result).__name__)
             return None
 
-        order_id = str(result.get("orderID", result.get("order_id", result.get("orderId", "")))).strip()
+        order_id = self._extract_order_id(result)
         if not order_id:
             self.last_error = "missing_order_id"
             logger.warning("Order rejected for %s: missing order id in response %s",
@@ -102,6 +110,7 @@ class EdgeExecutor:
             order_id=order_id,
             token_id=opp.buy_token_id,
             condition_id=opp.matched_event.poly_market.condition_id,
+            risk_event_id="",
             sport=opp.matched_event.sport,
             side="BUY",
             price=limit_price,
@@ -117,3 +126,42 @@ class EdgeExecutor:
             order_id, opp.buy_token_id, opp.shares, limit_price, opp.adjusted_edge,
         )
         return order
+
+    def place_cashout_order(self, *, token_id: str, size: float, price: float) -> dict:
+        token = str(token_id or "").strip()
+        qty = float(size or 0.0)
+        limit_price = round(float(price or 0.0), 4)
+        limit_price = max(0.01, min(0.99, limit_price))
+
+        if not token or qty <= 0:
+            self.last_error = "invalid_cashout_size"
+            return {"ok": False, "error": self.last_error}
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import SELL
+
+            signed = self.poly.create_order(
+                OrderArgs(
+                    price=limit_price,
+                    size=qty,
+                    side=SELL,
+                    token_id=token,
+                )
+            )
+            result = self.poly.post_order(
+                signed,
+                orderType=OrderType.GTC,
+                post_only=False,
+            )
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error}
+
+        order_id = self._extract_order_id(result)
+        if not order_id:
+            self.last_error = "missing_order_id"
+            return {"ok": False, "error": self.last_error, "raw": result}
+
+        self.last_error = ""
+        return {"ok": True, "order_id": order_id, "price": limit_price, "size": qty}

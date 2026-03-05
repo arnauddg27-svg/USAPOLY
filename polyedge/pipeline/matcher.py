@@ -121,6 +121,14 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 _SPREAD_POINT_PARENS_RE = re.compile(r"\(\s*([+-]?\d+(?:\.\d+)?)\s*\)\s*$")
 _SPREAD_POINT_TRAILING_RE = re.compile(r"(?:^|\s)([+-]\d+(?:\.\d+)?)\s*$")
+_YES_NO_TARGET_PATTERNS = (
+    re.compile(r"\bwill\s+(.+?)\s+win\b", re.IGNORECASE),
+    re.compile(r"\bwill\s+(.+?)\s+cover\b", re.IGNORECASE),
+    re.compile(
+        r"\bwill\s+(.+?)\s*(?:\(\s*[+-]?\d+(?:\.\d+)?\s*\)|[+-]\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+)
 # Safety-first: keep clearly wrong cross-date mismatches out while allowing
 # moderate feed/provider timestamp drift around game-day windows.
 _MAX_START_TIME_DRIFT_SEC = 36 * 3600
@@ -324,6 +332,17 @@ def _names_match(full_name: str, candidate: str) -> bool:
     return _name_match_strength(full_name, candidate) > 0
 
 
+def _extract_yes_no_target_team(question: str) -> str:
+    q = str(question or "").strip()
+    if not q:
+        return ""
+    for pattern in _YES_NO_TARGET_PATTERNS:
+        m = pattern.search(q)
+        if m:
+            return str(m.group(1) or "").strip(" ?:-")
+    return ""
+
+
 def _parse_iso_utc(raw: str) -> datetime | None:
     if isinstance(raw, (int, float)):
         val = float(raw)
@@ -442,7 +461,11 @@ def _extract_named_point(question: str, team_name: str) -> float | None:
         return None
 
 
-def poly_spread_points(poly: PolyMarket) -> tuple[float | None, float | None]:
+def poly_spread_points(
+    poly: PolyMarket,
+    team_a_name: str = "",
+    team_b_name: str = "",
+) -> tuple[float | None, float | None]:
     """Return expected spread points for (outcome_a, outcome_b), if derivable."""
     point_a = _extract_spread_point(poly.outcome_a)
     point_b = _extract_spread_point(poly.outcome_b)
@@ -451,6 +474,10 @@ def poly_spread_points(poly: PolyMarket) -> tuple[float | None, float | None]:
         point_a = _extract_named_point(poly.question, poly.outcome_a)
     if point_b is None:
         point_b = _extract_named_point(poly.question, poly.outcome_b)
+    if point_a is None and team_a_name:
+        point_a = _extract_named_point(poly.question, team_a_name)
+    if point_b is None and team_b_name:
+        point_b = _extract_named_point(poly.question, team_b_name)
 
     if point_a is None and point_b is not None:
         point_a = -point_b
@@ -463,10 +490,16 @@ def spread_points_compatible(
     poly: PolyMarket,
     team_a_outcome: SportsOutcome,
     team_b_outcome: SportsOutcome,
+    team_a_name: str = "",
+    team_b_name: str = "",
     tol: float = 0.01,
 ) -> bool:
     """Ensure sportsbook spread line exactly matches the Polymarket spread line."""
-    expected_a, expected_b = poly_spread_points(poly)
+    expected_a, expected_b = poly_spread_points(
+        poly,
+        team_a_name=team_a_name,
+        team_b_name=team_b_name,
+    )
     if expected_a is None or expected_b is None:
         return False
     book_a = _extract_spread_point(team_a_outcome.name)
@@ -476,9 +509,32 @@ def spread_points_compatible(
     return abs(book_a - expected_a) <= tol and abs(book_b - expected_b) <= tol
 
 
+def _compatible_spread_book_count(
+    game: AllBookOdds,
+    poly: PolyMarket,
+    team_a: str,
+    team_b: str,
+) -> int:
+    count = 0
+    for team_a_outcome, team_b_outcome in getattr(game, "spread_books", {}).values():
+        oriented = orient_book_outcomes(team_a, team_b, team_a_outcome, team_b_outcome)
+        if oriented is None:
+            continue
+        if spread_points_compatible(
+            poly,
+            oriented[0],
+            oriented[1],
+            team_a_name=team_a,
+            team_b_name=team_b,
+        ):
+            count += 1
+    return count
+
+
 def match_events(
     games: list[AllBookOdds],
     polys: list[PolyMarket],
+    min_books_for_spread: int = 1,
 ) -> list[MatchedEvent]:
     """Match sportsbook games to Polymarket markets by team names.
 
@@ -490,6 +546,8 @@ def match_events(
     for game_idx, game in enumerate(games):
         expected_slug = sport_to_tag_slug(game.sport)
         candidates: list[_MatchCandidate] = []
+        # Set to 0 to disable pre-filtering spread markets at match-time.
+        required_spread_books = max(0, int(min_books_for_spread))
         for poly_idx, poly in enumerate(polys):
             # Cross-sport guard: only match within same sport
             if expected_slug and poly.sport_tag and poly.sport_tag != expected_slug:
@@ -529,25 +587,88 @@ def match_events(
                 generic_outcomes = out_a in generic_labels and out_b in generic_labels
                 title_home = _name_match_strength(game.home, poly.event_title)
                 title_away = _name_match_strength(game.away, poly.event_title)
-                if yes_no or not generic_outcomes or not (title_home and title_away):
+                if yes_no:
+                    # Some sports (notably rugby and soccer spreads) can use
+                    # Yes/No markets phrased as "Will Team X win/cover?".
+                    if expected_slug not in {"rugby", "soccer"}:
+                        continue
+                    question_text = str(getattr(poly, "question", "") or "")
+                    target_team = _extract_yes_no_target_team(question_text)
+                    if not (title_home and title_away):
+                        continue
+                    target_home = _name_match_strength(game.home, target_team) if target_team else 0
+                    target_away = _name_match_strength(game.away, target_team) if target_team else 0
+
+                    # Fallback when parser can't isolate target team cleanly.
+                    if target_home <= 0 and target_away <= 0:
+                        q_home = _name_match_strength(game.home, question_text)
+                        q_away = _name_match_strength(game.away, question_text)
+                        if q_home > q_away:
+                            target_home, target_away = q_home, 0
+                        elif q_away > q_home:
+                            target_home, target_away = 0, q_away
+                        else:
+                            continue
+
+                    if target_home > 0 and target_away > 0:
+                        if abs(target_home - target_away) < 20:
+                            continue
+                        if target_home > target_away:
+                            target_away = 0
+                        else:
+                            target_home = 0
+
+                    if target_home > 0 and target_away == 0:
+                        name_score = target_home + title_home + title_away
+                        candidate = MatchedEvent(
+                            sport=game.sport,
+                            all_odds=game,
+                            poly_market=poly,
+                            team_a=game.home,
+                            team_b=game.away,
+                        )
+                    elif target_away > 0 and target_home == 0:
+                        name_score = target_away + title_home + title_away
+                        candidate = MatchedEvent(
+                            sport=game.sport,
+                            all_odds=game,
+                            poly_market=poly,
+                            team_a=game.away,
+                            team_b=game.home,
+                        )
+                    else:
+                        continue
+                elif not generic_outcomes or not (title_home and title_away):
                     continue
-                name_score = title_home + title_away
-                candidate = MatchedEvent(
-                    sport=game.sport,
-                    all_odds=game,
-                    poly_market=poly,
-                    team_a=game.home,
-                    team_b=game.away,
-                )
+                else:
+                    name_score = title_home + title_away
+                    candidate = MatchedEvent(
+                        sport=game.sport,
+                        all_odds=game,
+                        poly_market=poly,
+                        team_a=game.home,
+                        team_b=game.away,
+                    )
 
             drift = start_time_drift_seconds(game.commence_time, poly.start_iso)
             if isfinite(drift) and not _start_times_compatible(game.commence_time, poly.start_iso):
                 continue
 
+            market_type = getattr(poly, "market_type", "moneyline")
+            if market_type == "spread" and required_spread_books > 0:
+                compatible_spread = _compatible_spread_book_count(
+                    game,
+                    poly,
+                    candidate.team_a,
+                    candidate.team_b,
+                )
+                if compatible_spread < required_spread_books:
+                    continue
+
             market_bonus = 0.0
-            if getattr(poly, "market_type", "moneyline") == "moneyline":
+            if market_type == "moneyline":
                 market_bonus += _MONEYLINE_SCORE_BONUS
-            elif getattr(poly, "market_type", "moneyline") == "spread":
+            elif market_type == "spread":
                 market_bonus += (
                     _SPREAD_SCORE_WITH_BOOKS_BONUS
                     if bool(getattr(game, "spread_books", {}))

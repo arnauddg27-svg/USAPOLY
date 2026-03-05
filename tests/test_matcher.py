@@ -97,6 +97,54 @@ class TestMatching:
         matches = match_events([_game()], [poly])
         assert len(matches) == 0
 
+    def test_rugby_yes_no_market_matches_target_team_question(self):
+        game = _game(
+            home="Brisbane Broncos",
+            away="Penrith Panthers",
+            sport="rugbyleague_nrl",
+            commence_time="2026-03-06T09:00:00Z",
+        )
+        poly = _poly(
+            outcome_a="Yes",
+            outcome_b="No",
+            title="NRL: Brisbane Broncos vs Penrith Panthers",
+            start_iso="2026-03-06T09:00:00Z",
+        )
+        poly.question = "Will Brisbane Broncos win?"
+        poly.sport_tag = "rugby"
+        matches = match_events([game], [poly])
+        assert len(matches) == 1
+        assert matches[0].team_a == "Brisbane Broncos"
+        assert matches[0].team_b == "Penrith Panthers"
+
+    def test_soccer_yes_no_spread_market_matches_target_team_question(self):
+        game = AllBookOdds(
+            sport="soccer_epl",
+            home="Tottenham Hotspur",
+            away="Arsenal",
+            commence_time="2026-03-08T15:00:00Z",
+            books={},
+            spread_books={
+                "BookA": (
+                    SportsOutcome("Tottenham Hotspur (+1.5)", -110, "BookA"),
+                    SportsOutcome("Arsenal (-1.5)", -110, "BookA"),
+                )
+            },
+        )
+        poly = _poly(
+            outcome_a="Yes",
+            outcome_b="No",
+            title="Tottenham Hotspur vs Arsenal",
+            start_iso="2026-03-08T15:00:00Z",
+        )
+        poly.question = "Will Tottenham Hotspur (+1.5) cover the spread?"
+        poly.sport_tag = "soccer"
+        poly.market_type = "spread"
+        matches = match_events([game], [poly], min_books_for_spread=1)
+        assert len(matches) == 1
+        assert matches[0].team_a == "Tottenham Hotspur"
+        assert matches[0].team_b == "Arsenal"
+
     def test_title_team_name_fallback_when_outcomes_are_generic(self):
         game = _game(
             home="Philadelphia Flyers",
@@ -229,6 +277,140 @@ class TestMatching:
         )
         assert ok is True
         assert bad is False
+
+    def test_spread_points_compatible_yes_no_uses_team_names_from_question(self):
+        poly = PolyMarket(
+            event_title="Tottenham Hotspur vs Arsenal",
+            condition_id="cond-yes-no-spread",
+            outcome_a="Yes",
+            outcome_b="No",
+            token_id_a="tok_yes",
+            token_id_b="tok_no",
+            market_type="spread",
+            question="Will Tottenham Hotspur (+1.5) cover the spread?",
+            sport_tag="soccer",
+            start_iso="2026-03-08T15:00:00Z",
+        )
+        ok = spread_points_compatible(
+            poly,
+            SportsOutcome("Tottenham Hotspur (+1.5)", -110, "BookA"),
+            SportsOutcome("Arsenal (-1.5)", -110, "BookA"),
+            team_a_name="Tottenham Hotspur",
+            team_b_name="Arsenal",
+        )
+        bad = spread_points_compatible(
+            poly,
+            SportsOutcome("Tottenham Hotspur (+0.5)", -110, "BookA"),
+            SportsOutcome("Arsenal (-0.5)", -110, "BookA"),
+            team_a_name="Tottenham Hotspur",
+            team_b_name="Arsenal",
+        )
+        assert ok is True
+        assert bad is False
+
+    def test_spread_candidate_skipped_when_no_compatible_lines(self):
+        game = AllBookOdds(
+            sport="soccer_epl",
+            home="Tottenham Hotspur",
+            away="Crystal Palace",
+            commence_time="2026-02-25T20:00:00Z",
+            books={},
+            spread_books={
+                "BookA": (
+                    SportsOutcome("Tottenham Hotspur (-1.5)", -110, "BookA"),
+                    SportsOutcome("Crystal Palace (+1.5)", -110, "BookA"),
+                )
+            },
+        )
+        poly = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-spread-mismatch",
+            outcome_a="Tottenham Hotspur",
+            outcome_b="Crystal Palace",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="Spread: Tottenham Hotspur (-2.5)",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        matches = match_events([game], [poly], min_books_for_spread=1)
+        assert matches == []
+
+    def test_spread_candidate_allowed_when_prefilter_disabled(self):
+        game = AllBookOdds(
+            sport="soccer_epl",
+            home="Tottenham Hotspur",
+            away="Crystal Palace",
+            commence_time="2026-02-25T20:00:00Z",
+            books={},
+            spread_books={
+                "BookA": (
+                    SportsOutcome("Tottenham Hotspur (-1.5)", -110, "BookA"),
+                    SportsOutcome("Crystal Palace (+1.5)", -110, "BookA"),
+                )
+            },
+        )
+        poly = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-spread-mismatch-no-prefilter",
+            outcome_a="Tottenham Hotspur",
+            outcome_b="Crystal Palace",
+            token_id_a="tok_a",
+            token_id_b="tok_b",
+            market_type="spread",
+            question="Spread: Tottenham Hotspur (-2.5)",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        matches = match_events([game], [poly], min_books_for_spread=0)
+        assert len(matches) == 1
+
+    def test_prefers_moneyline_when_spread_below_min_books_threshold(self):
+        game = AllBookOdds(
+            sport="soccer_epl",
+            home="Tottenham Hotspur",
+            away="Crystal Palace",
+            commence_time="2026-02-25T20:00:00Z",
+            books={
+                "BookML": (
+                    SportsOutcome("Tottenham Hotspur", -120, "BookML"),
+                    SportsOutcome("Crystal Palace", 240, "BookML"),
+                )
+            },
+            spread_books={
+                "BookA": (
+                    SportsOutcome("Tottenham Hotspur (-1.5)", -110, "BookA"),
+                    SportsOutcome("Crystal Palace (+1.5)", -110, "BookA"),
+                )
+            },
+        )
+        spread = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-spread",
+            outcome_a="Tottenham Hotspur",
+            outcome_b="Crystal Palace",
+            token_id_a="tok_sa",
+            token_id_b="tok_sb",
+            market_type="spread",
+            question="Spread: Tottenham Hotspur (-1.5)",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        moneyline = PolyMarket(
+            event_title="Tottenham vs Crystal Palace",
+            condition_id="cond-ml",
+            outcome_a="Tottenham Hotspur",
+            outcome_b="Crystal Palace",
+            token_id_a="tok_ma",
+            token_id_b="tok_mb",
+            market_type="moneyline",
+            sport_tag="soccer",
+            start_iso="2026-02-25T20:00:00Z",
+        )
+        matches = match_events([game], [spread, moneyline], min_books_for_spread=2)
+        assert len(matches) == 1
+        assert matches[0].poly_market.condition_id == "cond-ml"
 
     def test_poly_spread_points_supports_trailing_signed_values(self):
         poly = PolyMarket(

@@ -1,5 +1,10 @@
 import pytest
-from polyedge.data.odds_api import _extract_available_sport_keys, expand_sport_keys, parse_all_books_response
+from polyedge.data.odds_api import (
+    _extract_available_sport_keys,
+    augment_sport_keys_with_fallbacks,
+    expand_sport_keys,
+    parse_all_books_response,
+)
 from polyedge.models import AllBookOdds
 
 SAMPLE_RESPONSE = [
@@ -147,6 +152,33 @@ SOCCER_THREE_WAY_MUNCHEN_RESPONSE = [
     }
 ]
 
+SOCCER_SPREAD_ABBREV_RESPONSE = [
+    {
+        "sport_key": "soccer_epl",
+        "home_team": "Manchester City",
+        "away_team": "Arsenal",
+        "commence_time": "2026-03-08T15:00:00Z",
+        "bookmakers": [
+            {
+                "key": "book_a",
+                "title": "BookA",
+                "markets": [{"key": "spreads", "outcomes": [
+                    {"name": "Man City", "price": -110, "point": -0.5},
+                    {"name": "Arsenal", "price": -110, "point": 0.5},
+                ]}],
+            },
+            {
+                "key": "book_b",
+                "title": "BookB",
+                "markets": [{"key": "spreads", "outcomes": [
+                    {"name": "Arsenal", "price": -105, "point": 0.5},
+                    {"name": "Manchester City", "price": -115, "point": -0.5},
+                ]}],
+            },
+        ],
+    }
+]
+
 SOCCER_THREE_WAY_LISBON_RESPONSE = [
     {
         "sport_key": "soccer_portugal_primeira_liga",
@@ -280,15 +312,35 @@ class TestParseAllBooks:
         assert out_b.american_odds == 290
 
 
+    def test_soccer_spread_canonicalizes_bookmaker_names(self):
+        """Spread outcomes should use the API event's canonical team names,
+        not the bookmaker's raw names, so orient_book_outcomes succeeds."""
+        game = parse_all_books_response(SOCCER_SPREAD_ABBREV_RESPONSE)[0]
+        assert "BookA" in game.spread_books
+        assert "BookB" in game.spread_books
+        # BookA reported "Man City" but should be canonicalized to "Manchester City"
+        a_a, a_b = game.spread_books["BookA"]
+        assert a_a.name == "Manchester City (-0.5)"
+        assert a_b.name == "Arsenal (+0.5)"
+        # BookB had swapped order; should be oriented and canonicalized
+        b_a, b_b = game.spread_books["BookB"]
+        assert b_a.name == "Manchester City (-0.5)"
+        assert b_b.name == "Arsenal (+0.5)"
+
+
 class TestSportExpansion:
-    def test_expands_soccer_and_tennis_wildcards(self):
-        requested = ["soccer_all", "tennis_all"]
+    def test_expands_soccer_tennis_cricket_rugby_table_tennis_wildcards(self):
+        requested = ["soccer_all", "tennis_all", "cricket_all", "rugby_all", "table_tennis_all"]
         available = [
             "basketball_nba",
             "soccer_epl",
             "soccer_uefa_champs_league",
             "tennis_atp_us_open",
             "tennis_wta_french_open",
+            "cricket_odi",
+            "rugby_union_six_nations",
+            "rugbyleague_nrl",
+            "table_tennis_china_open",
         ]
         resolved = expand_sport_keys(requested, available)
         assert resolved == [
@@ -296,6 +348,10 @@ class TestSportExpansion:
             "soccer_uefa_champs_league",
             "tennis_atp_us_open",
             "tennis_wta_french_open",
+            "cricket_odi",
+            "rugby_union_six_nations",
+            "rugbyleague_nrl",
+            "table_tennis_china_open",
         ]
 
     def test_wildcard_expansion_preserves_order_and_deduplicates(self):
@@ -319,6 +375,28 @@ class TestSportExpansion:
         available = ["soccer_epl"]
         resolved = expand_sport_keys(requested, available)
         assert resolved == ["basketball_nba", "soccer_epl"]
+
+    def test_appends_cricket_fallback_keys_for_cricket_family_tokens(self):
+        requested = ["basketball_nba", "cricket"]
+        resolved = ["basketball_nba", "cricket_t20_world_cup"]
+        augmented = augment_sport_keys_with_fallbacks(requested, resolved)
+        assert "basketball_nba" in augmented
+        assert "cricket_t20_world_cup" in augmented
+        assert "cricket_ipl" in augmented
+        assert "cricket_psl" in augmented
+        assert "cricket_test_match" in augmented
+
+    def test_does_not_append_cricket_fallback_keys_without_cricket_scope(self):
+        requested = ["basketball_nba", "soccer_all"]
+        resolved = ["basketball_nba", "soccer_epl"]
+        augmented = augment_sport_keys_with_fallbacks(requested, resolved)
+        assert augmented == ["basketball_nba", "soccer_epl"]
+
+    def test_resolves_rugby_family_alias_to_available_rugby_keys(self):
+        requested = ["rugby"]
+        available = ["rugby_union_six_nations", "rugbyleague_nrl", "soccer_epl"]
+        resolved = expand_sport_keys(requested, available)
+        assert resolved == ["rugby_union_six_nations", "rugbyleague_nrl"]
 
 
 class TestAvailableSportsExtraction:

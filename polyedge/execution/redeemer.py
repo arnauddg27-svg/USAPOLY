@@ -71,6 +71,7 @@ def _condition_bytes(condition_id: str) -> bytes:
 class AutoRedeemer:
     private_key: str
     holder_address: str = ""
+    query_address: str = ""
     rpc_url: str = DEFAULT_RPC
     usdc_address: str = DEFAULT_USDC
     claim_cooldown_sec: int = 14400
@@ -83,6 +84,7 @@ class AutoRedeemer:
             self.enabled = False
             self.signer_address = ""
             self.holder_address = (self.holder_address or "").strip()
+            self.query_address = (self.query_address or self.holder_address or "").strip()
             self.web3 = None
             self.ctf = None
             self.disable_reason = "missing_private_key"
@@ -93,6 +95,8 @@ class AutoRedeemer:
         self.signer_address = Web3.to_checksum_address(signer.address)
         holder = (self.holder_address or self.signer_address).strip()
         self.holder_address = Web3.to_checksum_address(holder)
+        query = (self.query_address or self.holder_address).strip()
+        self.query_address = Web3.to_checksum_address(query) if query else ""
         self.usdc_address = Web3.to_checksum_address(self.usdc_address or DEFAULT_USDC)
         self.ctf = self.web3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS),
@@ -109,7 +113,12 @@ class AutoRedeemer:
     def _request_json(self, url: str) -> list[dict]:
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": self.user_agent, "Accept": "application/json"},
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://polymarket.com",
+                "Referer": "https://polymarket.com/",
+            },
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -120,13 +129,20 @@ class AutoRedeemer:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
-    def fetch_redeemable_positions(
+    def fetch_positions(
         self,
         *,
         limit: int = 500,
         max_pages: int = 3,
+        redeemable_only: bool | None = None,
+        query_address: str = "",
     ) -> list[dict]:
-        if not self.enabled:
+        user = (query_address or self.query_address or "").strip()
+        if not user:
+            return []
+        try:
+            user = Web3.to_checksum_address(user)
+        except Exception:
             return []
         safe_limit = max(1, min(int(limit), 2000))
         safe_pages = max(1, min(int(max_pages), 20))
@@ -135,7 +151,7 @@ class AutoRedeemer:
         for _ in range(safe_pages):
             query = urllib.parse.urlencode(
                 {
-                    "user": self.holder_address,
+                    "user": user,
                     "limit": safe_limit,
                     "offset": offset,
                     "sizeThreshold": 0,
@@ -153,18 +169,33 @@ class AutoRedeemer:
                 break
             offset += safe_limit
 
-        redeemable: list[dict] = []
+        filtered: list[dict] = []
         for pos in rows:
-            if not bool(pos.get("redeemable")):
+            is_redeemable = bool(pos.get("redeemable"))
+            if redeemable_only is True and not is_redeemable:
+                continue
+            if redeemable_only is False and is_redeemable:
                 continue
             size = _to_float(pos.get("size")) or 0.0
             token_id = str(pos.get("asset") or "").strip()
             condition_id = str(pos.get("conditionId") or "").strip()
             if size <= 0 or not token_id or not condition_id:
                 continue
-            redeemable.append(pos)
-        redeemable.sort(key=lambda p: _to_float(p.get("size")) or 0.0, reverse=True)
-        return redeemable
+            filtered.append(pos)
+        filtered.sort(key=lambda p: _to_float(p.get("size")) or 0.0, reverse=True)
+        return filtered
+
+    def fetch_redeemable_positions(
+        self,
+        *,
+        limit: int = 500,
+        max_pages: int = 3,
+    ) -> list[dict]:
+        return self.fetch_positions(
+            limit=limit,
+            max_pages=max_pages,
+            redeemable_only=True,
+        )
 
     def in_cooldown(self, token_id: str) -> bool:
         now = time.time()

@@ -27,6 +27,12 @@ services:
       - "8502"
       - --server.address
       - 0.0.0.0
+      - --server.headless
+      - "true"
+      - --server.enableWebsocketCompression
+      - "false"
+      - --browser.gatherUsageStats
+      - "false"
     ports:
       - "8502:8502"
     volumes:

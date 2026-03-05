@@ -56,6 +56,7 @@ def test_full_pipeline_finds_edge():
 
     # 6. Detect edge — true ~0.60, fill ~0.484, adj_edge ~0.10
     cfg = EdgeConfig()
+    cfg.max_edge = 0.20
     opps = detect_edge(matches[0], agg, book_a, book_b, cfg, hours_until=5.0)
     assert len(opps) >= 1
     opp = opps[0]
