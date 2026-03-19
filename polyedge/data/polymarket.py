@@ -5,6 +5,14 @@ import aiohttp
 
 from polyedge.models import BookLevel, OrderBook, PolyMarket
 
+
+
+def _us_slug(gamma_slug: str) -> str:
+    """Prepend aec- prefix for Polymarket US market slugs."""
+    if not gamma_slug or gamma_slug.startswith("aec-") or gamma_slug.startswith("tec-"):
+        return gamma_slug
+    return "aec-" + gamma_slug
+
 logger = logging.getLogger(__name__)
 
 POLY_CLOB_BASE = "https://clob.polymarket.com"
@@ -339,7 +347,7 @@ def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMar
                     event.get("start"),
                     event.get("startDate"),
                 ),
-                market_slug=str(market.get("slug") or event.get("slug") or "").strip(),
+                market_slug=_us_slug(str(market.get("slug") or event.get("slug") or "").strip()),
             )
         )
     return results
