@@ -591,16 +591,23 @@ class PolyEdgeBot:
             return None
         try:
             balances = self.poly_client.account.balances()
-            # Parse response — try common field names
+            # Polymarket US returns {'balances': [{'currentBalance': 520, ...}]}
+            if isinstance(balances, dict) and "balances" in balances:
+                bal_list = balances["balances"]
+                if bal_list and isinstance(bal_list, list):
+                    entry = bal_list[0]
+                    for key in ("currentBalance", "buyingPower", "available"):
+                        if key in entry:
+                            return float(entry[key])
+            # Fallback: try flat dict keys
             if isinstance(balances, dict):
-                for key in ("available", "balance", "cash", "usd", "available_balance"):
+                for key in ("available", "balance", "cash", "usd", "available_balance", "currentBalance"):
                     if key in balances:
                         return float(balances[key])
             if hasattr(balances, "available"):
                 return float(balances.available)
             if hasattr(balances, "balance"):
                 return float(balances.balance)
-            # If it's a number directly
             return float(balances)
         except Exception as e:
             logger.error("Balance fetch failed: %s", e)
