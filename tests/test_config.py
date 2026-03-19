@@ -12,13 +12,15 @@ def test_config_loads_defaults():
     assert cfg.min_edge == 0.03
     assert cfg.max_edge == 0.05
     assert cfg.min_books == 4
-    assert cfg.soccer_min_books == 4
+    assert cfg.soccer_min_books == 2
     assert cfg.moneyline_favorites_only is False
     assert cfg.fraction_kelly == 0.15
-    assert cfg.event_cap_kelly_multiplier == 3.0
+    assert cfg.event_cap_kelly_multiplier == 1.0
     assert cfg.no_resting_orders is True
     assert cfg.close_orders_before_event_sec == 300
-    assert cfg.auto_cashout_enabled is True
+    assert cfg.max_fill_price == 0.91
+    assert cfg.max_per_event_pct == 0.05
+    assert cfg.auto_cashout_enabled is False
     assert cfg.cashout_cooldown_sec == 3600
     assert cfg.cashout_max_per_cycle == 1
     assert cfg.cashout_min_price == 0.99
@@ -30,9 +32,11 @@ def test_config_loads_defaults():
     assert cfg.devig_method == "power"
     assert "baseball_mlb" in cfg.sports
     assert "soccer_epl" in cfg.sports
-    assert "tennis_all" in cfg.sports
-    assert "cricket_all" in cfg.sports
-    assert "table_tennis_all" in cfg.sports
+    assert "tennis_atp" in cfg.sports
+    assert "tennis_wta" in cfg.sports
+    assert "cricket" in cfg.sports
+    assert "rugby" in cfg.sports
+    assert "table_tennis" in cfg.sports
 
 def test_config_loads_from_env(monkeypatch):
     monkeypatch.setenv("TRADING_ENABLED", "true")

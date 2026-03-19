@@ -19,6 +19,29 @@ SPORT_TAG_SLUGS = {
     "mma_mixed_martial_arts": "ufc",
 }
 
+# League-specific tag slugs for discovering individual game events.
+# The Gamma API events endpoint returns only futures/outrights for broad
+# sport tags (e.g. "soccer").  Individual match events (moneyline, spreads)
+# are indexed under league-specific tags like "premier-league".
+GAME_EVENT_TAG_SLUGS: dict[str, list[str]] = {
+    "soccer_epl": ["premier-league"],
+    "soccer_spain_la_liga": ["la-liga"],
+    "soccer_germany_bundesliga": ["bundesliga"],
+    "soccer_italy_serie_a": ["serie-a"],
+    "soccer_france_ligue_one": ["ligue-1"],
+    "soccer_uefa_champs_league": ["champions-league"],
+    "soccer_uefa_europa_league": ["europa-league"],
+    "soccer_mexico_ligamx": ["liga-mx"],
+    "soccer_usa_mls": ["mls"],
+    "soccer_brazil_serie_a": ["brasileirao"],
+    "soccer_fa_cup": ["fa-cup"],
+    "soccer_efl_champ": ["efl-championship"],
+    "soccer_portugal_primeira_liga": ["primeira-liga"],
+    "soccer_netherlands_eredivisie": ["eredivisie"],
+    "soccer_turkey_super_league": ["super-lig"],
+    "soccer_belgium_first_div": ["belgian-pro-league"],
+}
+
 
 def sport_to_tag_slug(sport_key: str) -> str:
     """Resolve an Odds API sport key to a Polymarket Gamma tag slug."""
@@ -35,13 +58,13 @@ def sport_to_tag_slug(sport_key: str) -> str:
         return "cricket"
     if key in {"rugby", "rugby_all", "rugby_*"}:
         return "rugby"
-    if key.startswith("rugby_") or key.startswith("rugbyleague_"):
+    if key.startswith("rugby_") or key.startswith("rugbyunion_") or key.startswith("rugbyleague_"):
         return "rugby"
     if key.startswith("table_tennis_"):
         return "table-tennis"
     return ""
 
-_SPREAD_PATTERN = re.compile(r"[+-]\s*\d+(?:\.\d+)?")
+_SPREAD_PATTERN = re.compile(r"(?<!\d)[+-]\s*\d+(?:\.\d+)?")
 _NUMERIC_PARENS_PATTERN = re.compile(r"\(\s*[+-]?\s*\d+(?:\.\d+)?\s*\)")
 _OVER_UNDER_RE = re.compile(r"\b(?:over|under)\b")
 _MONEYLINE_HINTS = (
@@ -210,6 +233,19 @@ def _classify_market_type(
     event_title: str = "",
     sport_tag: str = "",
 ) -> str | None:
+    # Shortcut: game events carry an explicit sportsMarketType field.
+    smt = str(market.get("sportsMarketType") or "").strip().lower()
+    if smt:
+        if smt == "moneyline":
+            question = str(market.get("question") or "").strip().lower()
+            if "draw" in question or "tie" in question:
+                return None
+            return "moneyline"
+        if smt == "spreads":
+            return "spread"
+        # totals, both_teams_to_score, etc. — we don't trade these.
+        return None
+
     outcomes_lower = [str(o).strip().lower() for o in outcomes]
     yes_no_market = set(outcomes_lower) == {"yes", "no"}
     sport_tag_l = str(sport_tag or "").strip().lower()
@@ -303,48 +339,69 @@ def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMar
                     event.get("start"),
                     event.get("startDate"),
                 ),
+                market_slug=str(market.get("slug") or event.get("slug") or "").strip(),
             )
         )
     return results
 
 async def fetch_sports_markets(sports: list[str]) -> list[PolyMarket]:
-    """Fetch game markets (moneyline + spread) from Polymarket Gamma API."""
-    seen_slugs = set()
-    slugs = []
+    """Fetch game markets (moneyline + spread) from Polymarket Gamma API.
+
+    For each sport we query:
+      1. The broad sport-level tag (e.g. ``soccer``, ``nba``) — catches
+         standard event-style markets.
+      2. League-specific game-event tags (e.g. ``premier-league``) — catches
+         individual match events with moneyline / spread lines that the Gamma
+         API does **not** surface under the broad sport tag.
+    """
+    seen_slugs: set[str] = set()
+    # Each entry is (tag_slug_to_query, sport_tag_for_matching).
+    slug_entries: list[tuple[str, str]] = []
     for s in sports:
-        slug = sport_to_tag_slug(s)
-        if slug and slug not in seen_slugs:
-            slugs.append(slug)
-            seen_slugs.add(slug)
-    markets = []
+        sport_slug = sport_to_tag_slug(s)
+        if sport_slug and sport_slug not in seen_slugs:
+            slug_entries.append((sport_slug, sport_slug))
+            seen_slugs.add(sport_slug)
+        # League-specific tags for game event discovery.
+        for league_slug in GAME_EVENT_TAG_SLUGS.get(s.strip().lower(), []):
+            if league_slug not in seen_slugs:
+                slug_entries.append((league_slug, sport_slug or league_slug))
+                seen_slugs.add(league_slug)
+    markets: list[PolyMarket] = []
     seen_conditions: set[str] = set()
     async with aiohttp.ClientSession(headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as session:
-        for slug in slugs:
+        for query_slug, sport_tag in slug_entries:
             offset = 0
             while offset < 1000:
-                params = {"tag_slug": slug, "active": "true", "closed": "false",
+                params = {"tag_slug": query_slug, "active": "true", "closed": "false",
                           "limit": 50, "offset": offset}
                 try:
                     async with session.get(f"{POLY_GAMMA_BASE}/events", params=params) as resp:
                         if resp.status != 200:
-                            logger.warning("Gamma API returned %d for slug=%s", resp.status, slug)
+                            logger.warning("Gamma API returned %d for slug=%s", resp.status, query_slug)
                             break
                         events = await resp.json()
                         if not isinstance(events, list):
-                            logger.warning("Gamma API returned non-list payload for slug=%s", slug)
+                            logger.warning("Gamma API returned non-list payload for slug=%s", query_slug)
                             break
                         if not events:
                             break
                         for ev in events:
-                            for pm in _extract_tradeable_markets(ev, sport_tag=slug):
+                            for pm in _extract_tradeable_markets(ev, sport_tag=sport_tag):
                                 if pm.condition_id in seen_conditions:
                                     continue
                                 seen_conditions.add(pm.condition_id)
                                 markets.append(pm)
                         offset += 50
                 except Exception as e:
-                    logger.warning("Gamma API fetch failed for slug=%s: %s", slug, e)
+                    logger.warning("Gamma API fetch failed for slug=%s: %s", query_slug, e)
                     break
+            slug_type_counts = {}
+            for pm in markets:
+                if pm.sport_tag == sport_tag:
+                    slug_type_counts[pm.market_type] = slug_type_counts.get(pm.market_type, 0) + 1
+            if slug_type_counts:
+                logger.info("Gamma slug=%s: %s", query_slug, slug_type_counts)
     return markets
 
 async def fetch_order_book(token_id: str) -> OrderBook:

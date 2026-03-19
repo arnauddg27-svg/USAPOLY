@@ -14,8 +14,10 @@ class TestExposureTracker:
     def test_per_event_limit(self, tmp_path):
         t = ExposureTracker(state_path=tmp_path / "exposure_state.json")
         t.record_trade("nba", "cond1", 50.0)
-        assert t.can_trade("nba", "cond1", 10.0, bankroll=1000,
-                           max_per_event=0.02) is False  # 60 > 20
+        reason = t.can_trade("nba", "cond1", 10.0, bankroll=1000,
+                             max_per_event=0.02)
+        assert reason is not None  # 60 > 20, should be rejected
+        assert "event_cap" in reason
 
     def test_daily_reset(self, tmp_path):
         t = ExposureTracker(state_path=tmp_path / "exposure_state.json")

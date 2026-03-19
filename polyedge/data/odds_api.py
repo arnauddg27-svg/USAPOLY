@@ -23,8 +23,8 @@ _SPORT_WILDCARDS = {
     "tennis_*": "tennis_",
     "cricket_all": "cricket_",
     "cricket_*": "cricket_",
-    "rugby_all": ("rugby_", "rugbyleague_"),
-    "rugby_*": ("rugby_", "rugbyleague_"),
+    "rugby_all": ("rugby_", "rugbyunion_", "rugbyleague_"),
+    "rugby_*": ("rugby_", "rugbyunion_", "rugbyleague_"),
     "rugbyleague_all": "rugbyleague_",
     "rugbyleague_*": "rugbyleague_",
     "rugby_league_all": "rugbyleague_",
@@ -38,7 +38,7 @@ _SPORT_FAMILY_ALIASES = {
     "tennis_atp": "tennis_atp_",
     "tennis_wta": "tennis_wta_",
     "cricket": "cricket_",
-    "rugby": ("rugby_", "rugbyleague_"),
+    "rugby": ("rugby_", "rugbyunion_", "rugbyleague_"),
     "rugbyleague": "rugbyleague_",
     "rugby_league": "rugbyleague_",
     "table_tennis": "table_tennis_",
@@ -278,6 +278,7 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
     for event in data:
         books: dict[str, tuple[SportsOutcome, SportsOutcome]] = {}
         spread_books: dict[str, tuple[SportsOutcome, SportsOutcome]] = {}
+        draw_odds: dict[str, float] = {}
         home = event.get("home_team", "")
         away = event.get("away_team", "")
         for bm in event.get("bookmakers", []):
@@ -295,6 +296,17 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
                     )
                     if pair is not None:
                         books[title] = pair
+                    # Extract draw odds for 3-way soccer markets.
+                    for row in outcomes:
+                        if isinstance(row, dict) and _is_draw_label(row.get("name")):
+                            price = row.get("price")
+                            if price is not None:
+                                # Convert American odds to decimal.
+                                if price >= 0:
+                                    draw_odds[title] = 1 + price / 100
+                                else:
+                                    draw_odds[title] = 1 + 100 / abs(price)
+                            break
                 elif key == "spreads":
                     pair = _parse_outcome_pair(
                         outcomes,
@@ -314,6 +326,7 @@ def parse_all_books_response(data: list[dict]) -> list[AllBookOdds]:
                     commence_time=event.get("commence_time", ""),
                     books=books,
                     spread_books=spread_books,
+                    draw_odds=draw_odds,
                 )
             )
     return results
@@ -438,6 +451,8 @@ async def fetch_all_odds(
     api_key: str,
     regions: str = "us,fr,uk",
     cricket_regions: str = "us,uk,eu,au",
+    soccer_regions: str = "us,us2,uk,eu,au,fr,se",
+    nhl_regions: str = "us",
 ) -> list[AllBookOdds]:
     """Fetch odds for all configured sports, keeping all bookmakers.
 
@@ -458,6 +473,8 @@ async def fetch_all_odds(
     all_games: list[AllBookOdds] = []
     configured_regions = str(regions or "").strip() or "us,fr,uk"
     configured_cricket_regions = str(cricket_regions or "").strip() or configured_regions
+    configured_soccer_regions = str(soccer_regions or "").strip() or configured_regions
+    configured_nhl_regions = str(nhl_regions or "").strip() or configured_regions
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         resolved_sports = requested_sports
         if any(
@@ -494,11 +511,15 @@ async def fetch_all_odds(
         )
 
         for sport in resolved_sports:
-            sport_regions = (
-                configured_cricket_regions
-                if str(sport).startswith("cricket_")
-                else configured_regions
-            )
+            _sk = str(sport)
+            if _sk.startswith("icehockey_nhl"):
+                sport_regions = configured_nhl_regions
+            elif _sk.startswith("cricket_"):
+                sport_regions = configured_cricket_regions
+            elif _sk.startswith("soccer_") or _sk.startswith("rugby_") or _sk.startswith("rugbyunion_") or _sk.startswith("rugbyleague_"):
+                sport_regions = configured_soccer_regions
+            else:
+                sport_regions = configured_regions
             url = f"{ODDS_API_BASE}/sports/{sport}/odds/"
             params = {
                 "apiKey": api_key,
@@ -544,6 +565,9 @@ async def fetch_all_odds(
                         logger.warning("Odds API returned non-list payload for %s", sport)
                         continue
                     games = parse_all_books_response(data)
+                    spread_count = sum(1 for g in games if g.spread_books)
+                    if spread_count:
+                        logger.info("Odds API %s: %d games, %d with spread lines", sport, len(games), spread_count)
                     for g in games:
                         g.sport = sport
                     all_games.extend(games)

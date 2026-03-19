@@ -1248,11 +1248,7 @@ with tab_overview:
     live_pnl_usd = _to_float_or_none(health.get("pnl_usd"))
     claims_today = int(_to_float_or_none(health.get("claims_today")) or 0)
     claimed_usdc_today = _to_float_or_none(health.get("claimed_usdc_today")) or 0.0
-    portfolio_address = (
-        str(health.get("wallet_address") or "").strip()
-        or _read_env_value("POLY_FUNDER_ADDRESS")
-        or _read_env_value("POLY_ADDRESS")
-    )
+    portfolio_address = str(health.get("wallet_address") or "").strip()
     positions_summary = {"fetched": False, "error": "not_needed"}
     open_positions_value_usd = _to_float_or_none(health.get("open_positions_value_usd"))
     open_positions_count_raw = _to_float_or_none(health.get("open_positions_count"))
@@ -1865,8 +1861,8 @@ with tab_config:
             max_per_event = st.number_input(
                 "Max Per Event %",
                 min_value=0.005,
-                max_value=0.50,
-                value=_clamp(_safe_float(current.get("MAX_PER_EVENT_PCT"), 0.02), 0.005, 0.50),
+                max_value=1.0,
+                value=_clamp(_safe_float(current.get("MAX_PER_EVENT_PCT"), 0.02), 0.005, 1.0),
                 step=0.005,
                 format="%.3f",
             )

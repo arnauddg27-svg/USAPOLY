@@ -9,15 +9,25 @@ cd "$ROOT_DIR"
 
 FILES=(
   "docker-compose.yml"
+  "requirements.txt"
   "run_dashboard.sh"
   "polyedge/dashboard.py"
   "polyedge/main.py"
   "polyedge/config.py"
-  "polyedge/execution/sizing.py"
-  "polyedge/risk/limits.py"
   "polyedge/models.py"
-  "polyedge/execution/executor.py"
   "polyedge/paths.py"
+  "polyedge/data/odds_api.py"
+  "polyedge/data/polymarket.py"
+  "polyedge/pipeline/devig.py"
+  "polyedge/pipeline/matcher.py"
+  "polyedge/pipeline/edge_detector.py"
+  "polyedge/pipeline/aggregator.py"
+  "polyedge/execution/executor.py"
+  "polyedge/execution/sizing.py"
+  "polyedge/execution/redeemer.py"
+  "polyedge/risk/limits.py"
+  "polyedge/monitoring/audit_log.py"
+  "config/.env"
 )
 
 for file in "${FILES[@]}"; do

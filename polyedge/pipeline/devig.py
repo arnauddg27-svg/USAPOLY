@@ -69,6 +69,42 @@ def power_devig(
     return p_a, p_b
 
 
+def devig_three_way(
+    decimal_a: float, decimal_draw: float, decimal_b: float, method: str = "power"
+) -> tuple[float, float]:
+    """Devig a 3-way market (e.g. soccer home/draw/away) and return (prob_a, prob_b).
+
+    The draw probability is accounted for in the devig, so prob_a + prob_b < 1.0.
+    This gives correct unconditional win probabilities for comparison with
+    Polymarket, which prices each team's win probability independently.
+
+    Args:
+        decimal_a: Decimal odds for side A (home).
+        decimal_draw: Decimal odds for draw.
+        decimal_b: Decimal odds for side B (away).
+        method: ``"power"`` (default) or ``"multiplicative"``.
+
+    Returns:
+        (true_prob_a, true_prob_b) where prob_a + prob_b < 1.0.
+    """
+    imp_a = 1.0 / decimal_a
+    imp_d = 1.0 / decimal_draw
+    imp_b = 1.0 / decimal_b
+    total = imp_a + imp_d + imp_b
+
+    if method == "power" and total > 1.0 + 1e-9:
+        def objective(k: float) -> float:
+            return imp_a ** k + imp_d ** k + imp_b ** k - 1.0
+        try:
+            k = brentq(objective, 0.01, 5.0, xtol=1e-12, maxiter=100)
+            return imp_a ** k, imp_b ** k
+        except ValueError:
+            pass  # fall through to multiplicative
+
+    # Multiplicative fallback: divide each by total overround.
+    return imp_a / total, imp_b / total
+
+
 def devig(
     decimal_a: float, decimal_b: float, method: str = "power"
 ) -> tuple[float, float]:

@@ -80,6 +80,51 @@ TEAM_ALIASES: dict[str, list[str]] = {
     "Seattle Mariners": ["Mariners"], "St. Louis Cardinals": ["Cardinals"],
     "Tampa Bay Rays": ["Rays"], "Texas Rangers": ["Rangers"],
     "Toronto Blue Jays": ["Blue Jays"], "Washington Nationals": ["Nationals", "Nats"],
+    # Soccer – EPL
+    "Arsenal": ["Arsenal FC", "Gunners"],
+    "Aston Villa": ["Aston Villa FC", "Villa"],
+    "AFC Bournemouth": ["Bournemouth"],
+    "Brentford": ["Brentford FC", "Bees"],
+    "Brighton and Hove Albion": ["Brighton", "Brighton & Hove Albion FC", "BHA"],
+    "Burnley": ["Burnley FC", "Clarets"],
+    "Chelsea": ["Chelsea FC"],
+    "Crystal Palace": ["Crystal Palace FC", "Palace"],
+    "Everton": ["Everton FC", "Toffees"],
+    "Fulham": ["Fulham FC", "Cottagers"],
+    "Leeds United": ["Leeds", "Leeds United FC"],
+    "Liverpool": ["Liverpool FC", "Reds"],
+    "Manchester City": ["Man City", "Manchester City FC", "Man. City"],
+    "Manchester United": ["Man Utd", "Man United", "Manchester United FC", "Man. United"],
+    "Newcastle United": ["Newcastle", "Newcastle United FC", "Magpies"],
+    "Nottingham Forest": ["Nott'm Forest", "Nottm Forest", "Forest", "Nottingham Forest FC"],
+    "Sunderland": ["Sunderland AFC", "Black Cats"],
+    "Tottenham Hotspur": ["Tottenham", "Spurs", "Tottenham Hotspur FC"],
+    "West Ham United": ["West Ham", "West Ham United FC", "Hammers"],
+    "Wolverhampton Wanderers": ["Wolves", "Wolverhampton", "Wolverhampton Wanderers FC"],
+    # Soccer – La Liga
+    "Real Madrid": ["Real Madrid CF", "Madrid"],
+    "Barcelona": ["FC Barcelona", "Barca", "Barça"],
+    "Atletico Madrid": ["Atlético Madrid", "Atletico", "Atlético de Madrid"],
+    "Real Sociedad": ["Sociedad", "Real Sociedad de Fútbol", "La Real"],
+    "Real Betis": ["Betis", "Real Betis Balompié"],
+    "Villarreal": ["Villarreal CF"],
+    "Athletic Bilbao": ["Athletic Club", "Bilbao", "Athletic"],
+    "Sevilla": ["Sevilla FC"],
+    "Valencia": ["Valencia CF"],
+    "Getafe": ["Getafe CF"],
+    "Girona": ["Girona FC"],
+    "Celta Vigo": ["Celta", "RC Celta"],
+    "RCD Mallorca": ["Mallorca"],
+    "Osasuna": ["CA Osasuna"],
+    "Rayo Vallecano": ["Rayo", "Rayo Vallecano de Madrid"],
+    "Real Valladolid": ["Valladolid"],
+    "Espanyol": ["RCD Espanyol"],
+    "Deportivo Alaves": ["Alavés", "Alaves", "Deportivo Alavés"],
+    "CD Leganes": ["Leganés", "Leganes"],
+    "Las Palmas": ["UD Las Palmas"],
+    "Real Oviedo": ["Oviedo"],
+    "Levante": ["Levante UD"],
+    "Elche": ["Elche CF"],
 }
 
 TEAM_CODE_ALIASES: dict[str, list[str]] = {
@@ -320,6 +365,14 @@ def _name_match_strength(full_name: str, candidate: str) -> int:
 
     if best > 0:
         return best
+
+    # Prefix match: "West Ham" matches "West Ham United" even without aliases.
+    if (
+        len(candidate_tokens) >= 2
+        and len(full_tokens) > len(candidate_tokens)
+        and candidate_tokens == full_tokens[: len(candidate_tokens)]
+    ):
+        return 82
 
     # Last-resort fallback to preserve coverage for previously unseen teams.
     if len(candidate_tokens) == 1 and candidate_tokens[0] == full_tokens[-1]:
@@ -718,17 +771,21 @@ def match_events(
             game_candidates[game_idx] = [sorted_missing[0]]
 
     # Global greedy assignment by candidate quality to avoid local first-match traps.
+    # Allow one match per (game, market_type) so moneyline and spread can both
+    # match for the same underlying game.
     all_candidates: list[_MatchCandidate] = []
     for game_idx, cands in game_candidates.items():
         _ = game_idx  # satisfy linters for explicit intent
         all_candidates.extend(sorted(cands, key=lambda c: c.total_score, reverse=True))
 
-    used_games: set[int] = set()
+    used_game_slots: set[tuple[int, str]] = set()   # (game_idx, market_type)
     used_polys: set[int] = set()
     for cand in sorted(all_candidates, key=lambda c: c.total_score, reverse=True):
-        if cand.game_idx in used_games or cand.poly_idx in used_polys:
+        mtype = getattr(cand.matched.poly_market, "market_type", "moneyline")
+        slot = (cand.game_idx, mtype)
+        if slot in used_game_slots or cand.poly_idx in used_polys:
             continue
         results.append(cand.matched)
-        used_games.add(cand.game_idx)
+        used_game_slots.add(slot)
         used_polys.add(cand.poly_idx)
     return results

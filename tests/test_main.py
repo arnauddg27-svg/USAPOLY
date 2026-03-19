@@ -58,22 +58,19 @@ def test_fast_cycle_dry_run_does_not_require_bankroll(monkeypatch):
 
 
 def test_init_poly_client_falls_back_to_dry_run_on_init_error(monkeypatch):
-    fake_client_mod = types.ModuleType("py_clob_client.client")
+    fake_pm_mod = types.ModuleType("polymarket_us")
 
     class BrokenClient:
         def __init__(self, *args, **kwargs):
             raise RuntimeError("boom")
 
-    fake_client_mod.ClobClient = BrokenClient
-    fake_constants_mod = types.ModuleType("py_clob_client.constants")
-    fake_constants_mod.POLYGON = 137
-
-    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
-    monkeypatch.setitem(sys.modules, "py_clob_client.constants", fake_constants_mod)
+    fake_pm_mod.PolymarketUS = BrokenClient
+    monkeypatch.setitem(sys.modules, "polymarket_us", fake_pm_mod)
 
     bot = PolyEdgeBot()
     bot.cfg.simulation_mode = False
-    bot.cfg.poly_private_key = "0xabc"
+    bot.cfg.polymarket_key_id = "test-key"
+    bot.cfg.polymarket_secret_key = "test-secret"
 
     bot._init_poly_client()
 
@@ -85,7 +82,8 @@ def test_init_poly_client_falls_back_to_dry_run_on_init_error(monkeypatch):
 def test_init_poly_client_skips_in_simulation_mode():
     bot = PolyEdgeBot()
     bot.cfg.simulation_mode = True
-    bot.cfg.poly_private_key = "0xabc"
+    bot.cfg.polymarket_key_id = "test-key"
+    bot.cfg.polymarket_secret_key = "test-secret"
 
     bot._init_poly_client()
 
@@ -101,7 +99,7 @@ def test_run_clamps_invalid_timing_config(monkeypatch, tmp_path):
     cfg = EdgeConfig()
     cfg.slow_cycle_multiplier = 0
     cfg.poll_interval_sec = 0
-    cfg.poly_private_key = ""
+    cfg.polymarket_key_id = ""
 
     calls = {"slow": 0, "fast": 0, "sleep": []}
 
@@ -208,8 +206,6 @@ def test_fast_cycle_no_resting_orders_skips_tracking_but_records_exposure(monkey
 
     bot.executor.place_order.assert_called_once()
     bot.order_mgr.track.assert_not_called()
-    cap_kwargs = bot.exposure.can_trade.call_args.kwargs
-    assert 0 < cap_kwargs["max_per_event"] <= bot.cfg.max_per_event_pct
     bot.exposure.record_trade.assert_called_once()
     args = bot.exposure.record_trade.call_args.args
     assert args[0] == "basketball_nba"
@@ -584,210 +580,8 @@ def test_fast_cycle_records_bankroll_blocker_for_live_mode(monkeypatch):
     assert stats["blocked_bankroll_unavailable"] == 1
 
 
-def test_get_bankroll_probes_and_switches_identity(monkeypatch):
-    fake_clob_types_mod = types.ModuleType("py_clob_client.clob_types")
-
-    class BalanceAllowanceParams:
-        def __init__(self, asset_type=None, token_id=None, signature_type=-1):
-            self.asset_type = asset_type
-            self.token_id = token_id
-            self.signature_type = signature_type
-
-    class AssetType:
-        COLLATERAL = "COLLATERAL"
-
-    fake_clob_types_mod.BalanceAllowanceParams = BalanceAllowanceParams
-    fake_clob_types_mod.AssetType = AssetType
-
-    fake_constants_mod = types.ModuleType("py_clob_client.constants")
-    fake_constants_mod.POLYGON = 137
-
-    class FakeClobClient:
-        def __init__(self, _host, key=None, chain_id=None, signature_type=None, funder=None):
-            self.key = key
-            self.chain_id = chain_id
-            self.builder = types.SimpleNamespace(sig_type=signature_type, funder=funder)
-
-        def set_api_creds(self, _creds):
-            return None
-
-        def create_or_derive_api_creds(self):
-            return {}
-
-        def get_balance_allowance(self, params):
-            sig = self.builder.sig_type if getattr(params, "signature_type", -1) == -1 else params.signature_type
-            funder = self.builder.funder
-            if sig == 2 and funder == "0xfund":
-                return {"balance": 250_000_000}
-            return {"balance": 0}
-
-    fake_client_mod = types.ModuleType("py_clob_client.client")
-    fake_client_mod.ClobClient = FakeClobClient
-
-    class DummyRedeemer:
-        def __init__(self, *args, **kwargs):
-            self.enabled = False
-            self.disable_reason = "test"
-            self.holder_address = kwargs.get("holder_address", "")
-
-    monkeypatch.setitem(sys.modules, "py_clob_client.clob_types", fake_clob_types_mod)
-    monkeypatch.setitem(sys.modules, "py_clob_client.constants", fake_constants_mod)
-    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
-    monkeypatch.setattr("polyedge.main.AutoRedeemer", DummyRedeemer)
-
-    bot = PolyEdgeBot()
-    bot.cfg.poly_private_key = "0xabc"
-    bot.cfg.poly_signature_type = 0
-    bot.cfg.poly_funder_address = "0xfund"
-    bot.poly_client = FakeClobClient("https://clob.polymarket.com", key="0xabc", chain_id=137, signature_type=0, funder=None)
-    bot._active_sig_type = 0
-    bot._active_funder = None
-
-    balance = bot._get_bankroll()
-
-    assert balance == pytest.approx(250.0)
-    assert bot._active_sig_type == 2
-    assert bot._active_funder == "0xfund"
-
-
-def test_claim_flow_runs_cashout_first_then_redeem(monkeypatch):
-    bot = PolyEdgeBot()
-    bot.cfg.simulation_mode = False
-    bot.cfg.trading_enabled = True
-    bot.cfg.auto_cashout_enabled = True
-    bot.cfg.auto_claim_enabled = True
-    bot.cfg.cashout_min_notional_usd = 0.0
-    bot.executor = MagicMock()
-    bot.poly_client = None
-
-    events: list[tuple[str, str]] = []
-
-    class DummyRedeemer:
-        enabled = True
-        disable_reason = ""
-        signer_address = "0xsigner"
-        holder_address = "0xholder"
-        query_address = "0xquery"
-
-        def __init__(self):
-            self._cooldowns = set()
-
-        def fetch_positions(self, **_kwargs):
-            return [{"asset": "tok-x", "conditionId": "cond-x", "size": 5, "curPrice": 0.992}]
-
-        def fetch_redeemable_positions(self, **_kwargs):
-            # Same token as cashout candidate: redeem path must still run.
-            return [{"asset": "tok-x", "conditionId": "cond-x", "size": 3, "outcomeIndex": 0}]
-
-        def in_cooldown(self, token_id):
-            return str(token_id) in self._cooldowns
-
-        def set_cooldown(self, token_id, _seconds):
-            self._cooldowns.add(str(token_id))
-            events.append(("cooldown", str(token_id)))
-
-        def redeem_position(self, pos):
-            events.append(("redeem", str(pos.get("asset") or "")))
-            return {"ok": True, "payout_usdc": 11.0, "tx_hash": "0xtx"}
-
-    bot.redeemer = DummyRedeemer()
-
-    def _cashout_side_effect(**kwargs):
-        events.append(("cashout", str(kwargs.get("token_id") or "")))
-        return {"ok": False, "error": "orderbook does not exist"}
-
-    bot.executor.place_cashout_order.side_effect = _cashout_side_effect
-
-    bot._claim_winning_positions()
-
-    assert events[0] == ("cashout", "tok-x")
-    assert ("redeem", "tok-x") in events
-    assert ("cooldown", "cashout:tok-x") in events
-    assert ("cooldown", "claim:tok-x") in events
-    assert bot.claims_today == 1
-    assert bot.claimed_usdc_today == pytest.approx(11.0)
-
-
 def test_cashout_limit_price_never_exceeds_clob_max():
     # tick=0.02 => CLOB max is 0.98; min_limit is above max.
     # Helper should return clob_max so caller can skip safely.
     price = PolyEdgeBot._cashout_limit_price(cur_price=0.995, tick=0.02, min_limit=0.99)
     assert price == pytest.approx(0.98)
-
-
-def test_cashout_skips_positions_below_min_notional():
-    bot = PolyEdgeBot()
-    bot.cfg.simulation_mode = False
-    bot.cfg.trading_enabled = True
-    bot.cfg.auto_cashout_enabled = True
-    bot.cfg.cashout_min_notional_usd = 100.0
-    bot.executor = MagicMock()
-    bot.poly_client = None
-
-    class DummyRedeemer:
-        def fetch_positions(self, **_kwargs):
-            return [{"asset": "tok-low", "conditionId": "cond-low", "size": 40, "curPrice": 0.99}]
-
-        def in_cooldown(self, _token_id):
-            return False
-
-        def set_cooldown(self, _token_id, _seconds):
-            return None
-
-    bot.redeemer = DummyRedeemer()
-
-    bot._cashout_winning_positions()
-
-    bot.executor.place_cashout_order.assert_not_called()
-
-
-def test_init_poly_client_invalid_claim_identity_falls_back(monkeypatch):
-    fake_client_mod = types.ModuleType("py_clob_client.client")
-
-    class FakeClobClient:
-        def __init__(self, _host, key=None, chain_id=None, signature_type=None, funder=None):
-            self.key = key
-            self.chain_id = chain_id
-            self.builder = types.SimpleNamespace(sig_type=signature_type, funder=funder)
-
-        def set_api_creds(self, _creds):
-            return None
-
-        def create_or_derive_api_creds(self):
-            return {}
-
-    fake_client_mod.ClobClient = FakeClobClient
-    fake_constants_mod = types.ModuleType("py_clob_client.constants")
-    fake_constants_mod.POLYGON = 137
-
-    class DummyRedeemer:
-        def __init__(self, *args, **kwargs):
-            holder = kwargs.get("holder_address", "")
-            query = kwargs.get("query_address", "")
-            if holder == "bad-holder" or query == "bad-user":
-                raise ValueError("bad claim identity")
-            self.enabled = True
-            self.disable_reason = ""
-            self.holder_address = holder
-            self.query_address = query
-            self.signer_address = "0xsigner"
-
-    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
-    monkeypatch.setitem(sys.modules, "py_clob_client.constants", fake_constants_mod)
-    monkeypatch.setattr("polyedge.main.AutoRedeemer", DummyRedeemer)
-
-    bot = PolyEdgeBot()
-    bot.cfg.simulation_mode = False
-    bot.cfg.trading_enabled = True
-    bot.cfg.poly_private_key = "0xabc"
-    bot.cfg.poly_signature_type = 2
-    bot.cfg.poly_funder_address = "0xfund"
-    bot.cfg.poly_claim_holder_address = "bad-holder"
-    bot.cfg.poly_claim_user_address = "bad-user"
-
-    bot._init_poly_client()
-
-    assert bot.poly_client is not None
-    assert bot.executor is not None
-    assert bot.order_mgr is not None
-    assert bot.redeemer is not None

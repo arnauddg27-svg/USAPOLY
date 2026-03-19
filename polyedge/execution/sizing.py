@@ -42,6 +42,11 @@ def compute_event_cap_pct(
     return min(safe_event_pct, kelly_pct * safe_kelly_mult)
 
 
+import logging
+
+_sizing_logger = logging.getLogger(__name__)
+
+
 def compute_bet_size(
     adjusted_edge: float,
     fill_price: float,
@@ -79,6 +84,15 @@ def compute_bet_size(
     safe_sport_pct = max(max_per_sport_pct, 0.0)
     safe_total_pct = max(max_total_pct, 0.0)
 
+    caps = [
+        ("kelly", bet),
+        ("event_cap", bankroll * event_cap_pct - event_exposure),
+        ("sport_cap", bankroll * safe_sport_pct - sport_exposure),
+        ("total_cap", bankroll * safe_total_pct - total_exposure),
+        ("book_depth", book_depth_usd * 0.8),
+        ("deployable", bankroll * (1 - cash_buffer_pct) - total_exposure),
+    ]
+
     bet = min(bet, bankroll * event_cap_pct - event_exposure)
     bet = min(bet, bankroll * safe_sport_pct - sport_exposure)
     bet = min(bet, bankroll * safe_total_pct - total_exposure)
@@ -87,5 +101,16 @@ def compute_bet_size(
     bet = min(bet, max_deployable)
     bet = max(bet, 0)
     if bet < min_bet:
+        binding = min(caps, key=lambda x: x[1])
+        _sizing_logger.info(
+            "bet_too_small: binding_cap=%s (%.2f), kelly_pct=%.6f, "
+            "bankroll=%.0f, edge=%.4f, fill=%.4f, "
+            "event_exp=%.2f, sport_exp=%.2f, total_exp=%.2f, "
+            "book_depth=%.2f, min_bet=%.2f",
+            binding[0], binding[1], kelly_pct,
+            bankroll, adjusted_edge, fill_price,
+            event_exposure, sport_exposure, total_exposure,
+            book_depth_usd, min_bet,
+        )
         return 0.0
     return round(bet, 2)

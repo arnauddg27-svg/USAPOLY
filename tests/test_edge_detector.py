@@ -118,6 +118,16 @@ class TestEdgeDetection:
         opps = detect_edge(matched, agg, book_a, book_b, cfg)
         assert opps == []
 
+    def test_buy_price_cap_is_strictly_below_81c(self):
+        matched, agg = _matched(0.90)
+        book_a = _book(0.81, 800)
+        book_b = _book(0.15, 800)
+        cfg = EdgeConfig()
+        cfg.max_edge = 0.50
+        cfg.max_fill_price = 0.81
+        opps = detect_edge(matched, agg, book_a, book_b, cfg)
+        assert not any(o.buy_outcome == "a" for o in opps)
+
 class TestGates:
     def test_spread_gate_fails(self):
         cfg = EdgeConfig()

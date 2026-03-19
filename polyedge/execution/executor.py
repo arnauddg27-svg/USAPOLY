@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class EdgeExecutor:
-    """Places limit orders on Polymarket based on identified edge opportunities."""
+    """Places orders on Polymarket US based on identified edge opportunities."""
 
     def __init__(self, poly_client):
         self.poly = poly_client
@@ -16,72 +16,62 @@ class EdgeExecutor:
     @staticmethod
     def _extract_order_id(result) -> str:
         if not isinstance(result, dict):
+            if hasattr(result, "id"):
+                return str(result.id).strip()
             return ""
         return str(
-            result.get("orderID", result.get("order_id", result.get("orderId", "")))
+            result.get("orderID", result.get("order_id", result.get("orderId", result.get("id", ""))))
         ).strip()
 
     def place_order(self, opp: EdgeOpportunity, cfg: EdgeConfig) -> OpenOrder | None:
-        """Build and submit a limit BUY order for the given opportunity.
-
-        Returns an OpenOrder on success, or None if trading is disabled,
-        the opportunity is invalid, or the API call fails/rejects.
-        """
+        """Build and submit a limit BUY order for the given opportunity."""
         if not cfg.trading_enabled:
             logger.info("Trading disabled — skipping %s", opp.buy_token_id)
             self.last_error = "trading_disabled"
             return None
 
         if opp.bet_usd <= 0 or opp.shares <= 0:
-            logger.debug(
-                "Skipping order: bet_usd=%.2f shares=%d", opp.bet_usd, opp.shares
-            )
+            logger.debug("Skipping order: bet_usd=%.2f shares=%d", opp.bet_usd, opp.shares)
             self.last_error = "invalid_order_size"
             return None
 
-        # Two execution modes:
-        # - resting quotes: maker-only post-only near mid
-        # - no-resting: aggressive capped-price buy + immediate cancel of remainder (IOC-like)
         if cfg.no_resting_orders:
             limit_price = round(float(opp.poly_fill_price), 4)
         else:
             limit_price = round(opp.poly_mid - cfg.order_offset, 4)
         limit_price = max(0.01, min(0.99, limit_price))
 
-        try:
-            from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
+        configured_cap = float(getattr(cfg, "max_fill_price", 0.91))
+        max_buy_price = max(0.01, min(0.99, configured_cap))
+        if limit_price >= max_buy_price:
+            self.last_error = f"buy_price_cap:{limit_price:.4f}>={max_buy_price:.4f}"
+            logger.info(
+                "Skipping order for %s due to buy cap (limit=%.4f cap=%.4f)",
+                opp.buy_token_id, limit_price, max_buy_price,
+            )
+            return None
 
-            if cfg.no_resting_orders:
-                # Use true taker-style execution with immediate-or-cancel semantics.
-                signed = self.poly.create_market_order(
-                    MarketOrderArgs(
-                        token_id=opp.buy_token_id,
-                        amount=round(float(opp.bet_usd), 6),
-                        side=BUY,
-                        price=limit_price,
-                        order_type=OrderType.FOK,
-                    )
-                )
-                result = self.poly.post_order(
-                    signed,
-                    orderType=OrderType.FOK,
-                    post_only=False,
-                )
-            else:
-                signed = self.poly.create_order(
-                    OrderArgs(
-                        price=limit_price,
-                        size=opp.shares,
-                        side=BUY,
-                        token_id=opp.buy_token_id,
-                    )
-                )
-                result = self.poly.post_order(
-                    signed,
-                    orderType=OrderType.GTC,
-                    post_only=True,
-                )
+        # Determine order intent based on which outcome we're buying
+        market_slug = getattr(opp.matched_event.poly_market, "market_slug", "")
+        # outcome_a is typically "Yes"/Long, outcome_b is "No"/Short
+        # If we're buying token_id_a, we want BUY_LONG; token_id_b means BUY_SHORT
+        if opp.buy_token_id == opp.matched_event.poly_market.token_id_a:
+            intent = "ORDER_INTENT_BUY_LONG"
+        else:
+            intent = "ORDER_INTENT_BUY_SHORT"
+
+        tif = ("TIME_IN_FORCE_FILL_OR_KILL" if cfg.no_resting_orders
+               else "TIME_IN_FORCE_GOOD_TILL_CANCEL")
+
+        try:
+            result = self.poly.orders.create({
+                "marketSlug": market_slug,
+                "intent": intent,
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": str(limit_price), "currency": "USD"},
+                "quantity": int(opp.shares),
+                "tif": tif,
+            })
         except Exception as e:
             self.last_error = str(e)
             logger.error("Order failed for %s: %s", opp.buy_token_id, e)
@@ -90,12 +80,6 @@ class EdgeExecutor:
         if not result:
             self.last_error = "empty_response"
             logger.warning("Order rejected for %s: empty response", opp.buy_token_id)
-            return None
-
-        if not isinstance(result, dict):
-            self.last_error = f"non_dict_response:{type(result).__name__}"
-            logger.warning("Order rejected for %s: unexpected response type %s",
-                           opp.buy_token_id, type(result).__name__)
             return None
 
         order_id = self._extract_order_id(result)
@@ -127,7 +111,8 @@ class EdgeExecutor:
         )
         return order
 
-    def place_cashout_order(self, *, token_id: str, size: float, price: float) -> dict:
+    def place_cashout_order(self, *, token_id: str, size: float, price: float,
+                            market_slug: str = "", sell_intent: str = "ORDER_INTENT_SELL_LONG") -> dict:
         token = str(token_id or "").strip()
         qty = float(size or 0.0)
         limit_price = round(float(price or 0.0), 4)
@@ -138,22 +123,14 @@ class EdgeExecutor:
             return {"ok": False, "error": self.last_error}
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import SELL
-
-            signed = self.poly.create_order(
-                OrderArgs(
-                    price=limit_price,
-                    size=qty,
-                    side=SELL,
-                    token_id=token,
-                )
-            )
-            result = self.poly.post_order(
-                signed,
-                orderType=OrderType.GTC,
-                post_only=False,
-            )
+            result = self.poly.orders.create({
+                "marketSlug": market_slug,
+                "intent": sell_intent,
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": str(limit_price), "currency": "USD"},
+                "quantity": int(qty),
+                "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+            })
         except Exception as exc:
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error}

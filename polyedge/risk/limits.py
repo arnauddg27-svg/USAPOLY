@@ -9,7 +9,7 @@ class ExposureTracker:
     def __init__(
         self,
         state_path: str | Path | None = None,
-        event_retention_sec: int = 6 * 3600,
+        event_retention_sec: int = 48 * 3600,
     ):
         self._by_event: dict[str, float] = defaultdict(float)
         self._by_sport: dict[str, float] = defaultdict(float)
@@ -220,25 +220,44 @@ class ExposureTracker:
         max_per_sport: float = 0.10,
         max_total: float = 0.30,
         daily_loss_limit: float = -0.05,
-    ) -> bool:
+    ) -> str | None:
+        """Return None if trade is allowed, or a string describing the rejection reason."""
         stake = self._to_float(amount)
         bank = self._to_float(bankroll)
         if stake is None or bank is None or stake <= 0 or bank <= 0:
-            return False
+            return f"invalid_inputs:stake={stake},bank={bank}"
 
         changed = self._prune_stale()
         if changed:
             self._persist_state()
 
-        if self.event_exposure(event_id) + stake > bank * max_per_event:
-            return False
-        if self.sport_exposure(sport) + stake > bank * max_per_sport:
-            return False
-        if self.total_exposure() + stake > bank * max_total:
-            return False
-        if self.daily_pnl < bank * daily_loss_limit:
-            return False
-        return True
+        ev_exp = self.event_exposure(event_id)
+        if ev_exp + stake > bank * max_per_event:
+            return (
+                f"event_cap:{ev_exp:.2f}+{stake:.2f}="
+                f"{ev_exp+stake:.2f}>{bank:.0f}*{max_per_event}="
+                f"{bank*max_per_event:.2f}"
+            )
+        sp_exp = self.sport_exposure(sport)
+        if sp_exp + stake > bank * max_per_sport:
+            return (
+                f"sport_cap:{sp_exp:.2f}+{stake:.2f}="
+                f"{sp_exp+stake:.2f}>{bank:.0f}*{max_per_sport}="
+                f"{bank*max_per_sport:.2f}"
+            )
+        tot_exp = self.total_exposure()
+        if tot_exp + stake > bank * max_total:
+            return (
+                f"total_cap:{tot_exp:.2f}+{stake:.2f}="
+                f"{tot_exp+stake:.2f}>{bank:.0f}*{max_total}="
+                f"{bank*max_total:.2f}"
+            )
+        if daily_loss_limit < 0 and self.daily_pnl < bank * daily_loss_limit:
+            return (
+                f"daily_loss:pnl={self.daily_pnl:.2f}<"
+                f"{bank:.0f}*{daily_loss_limit}={bank*daily_loss_limit:.2f}"
+            )
+        return None
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0

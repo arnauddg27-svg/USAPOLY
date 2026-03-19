@@ -109,6 +109,21 @@ class TestExecutor:
         assert result is not None
         assert 0.01 <= result.price <= 0.99
 
+    def test_rejects_order_at_or_above_buy_price_cap(self):
+        mock_poly = MagicMock()
+        executor = EdgeExecutor(mock_poly)
+        cfg = EdgeConfig()
+        cfg.trading_enabled = True
+        cfg.no_resting_orders = True
+        cfg.max_fill_price = 0.81
+        opp = _make_opportunity(fill=0.81)
+
+        result = executor.place_order(opp, cfg)
+
+        assert result is None
+        assert "buy_price_cap" in executor.last_error
+        mock_poly.create_market_order.assert_not_called()
+
     def test_no_resting_orders_uses_market_fok_mode(self):
         mock_poly = MagicMock()
         mock_poly.create_market_order.return_value = {"signed": True}

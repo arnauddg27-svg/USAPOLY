@@ -38,6 +38,10 @@ def log_decision(
             "raw_edge": round(opp.raw_edge, 4),
             "adjusted_edge": round(opp.adjusted_edge, 4),
             "books_used": opp.aggregated.books_used,
+            "book_detail": [
+                {"bk": bl.bookmaker, "prob_a": round(bl.prob_a, 4), "prob_b": round(bl.prob_b, 4)}
+                for bl in (opp.aggregated.per_book or [])
+            ] if action != "REJECTED" else None,
             "confidence": opp.confidence.name,
             "edge_source": opp.edge_source.value,
             "bet_usd": round(opp.bet_usd, 2),

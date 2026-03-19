@@ -21,6 +21,7 @@ def check_gates(
         "slippage": {"passed": slippage <= cfg.max_slippage, "value": slippage, "threshold": cfg.max_slippage},
         "spread": {"passed": book.spread <= cfg.max_spread, "value": book.spread, "threshold": cfg.max_spread},
         "time": {"passed": hours_until >= cfg.min_hours_before_event, "value": hours_until, "threshold": cfg.min_hours_before_event},
+        "time_ceiling": {"passed": cfg.max_hours_before_event <= 0 or hours_until <= cfg.max_hours_before_event, "value": hours_until, "threshold": cfg.max_hours_before_event},
     }
 
 
@@ -101,8 +102,9 @@ def detect_edge(
     opportunities = []
     rejected_out_of_edge_range = []
     target = cfg.target_shares
-    moneyline_favorites_only = (
-        getattr(matched.poly_market, "market_type", "moneyline") == "moneyline"
+    market_type = getattr(matched.poly_market, "market_type", "moneyline")
+    favorites_only = (
+        market_type in ("moneyline", "spread")
         and cfg.moneyline_favorites_only
     )
     favorite_side = "a" if agg.prob_a >= agg.prob_b else "b"
@@ -111,15 +113,42 @@ def detect_edge(
         ("a", agg.prob_a, book_a, matched.poly_market.token_id_a),
         ("b", agg.prob_b, book_b, matched.poly_market.token_id_b),
     ]:
-        if moneyline_favorites_only and side != favorite_side:
+        if favorites_only and side != favorite_side:
             continue
 
         fill_price, filled = compute_avg_fill_price(book.asks, target)
         if filled <= 0:
+            # Empty order book — build a minimal rejected entry for visibility.
+            if include_rejected:
+                _gates = {"empty_book": {"passed": False, "value": 0, "threshold": 1}}
+                rejected_out_of_edge_range.append(
+                    _build_opportunity(
+                        matched=matched, agg=agg, side=side, token_id=token_id,
+                        true_prob=true_prob, book=book, fill_price=0.0, filled=0.0,
+                        raw_edge=0.0, adjusted_edge=0.0, target=target, gates=_gates,
+                    )
+                )
             continue
         # In strict favorites-only mode, only allow buying the market-favorite side
         # at favorite pricing (>= 0.50).
-        if moneyline_favorites_only and fill_price < 0.50:
+        if favorites_only and fill_price < 0.50:
+            continue
+        # Cap filter: never buy at or above configured max entry price.
+        hard_buy_cap = float(getattr(cfg, "max_fill_price", 0.91))
+        if fill_price >= hard_buy_cap:
+            if include_rejected:
+                _gates = {"fill_price_cap": {"passed": False, "value": fill_price, "threshold": hard_buy_cap}}
+                effective_prob = fill_price + cfg.fee_rate
+                raw_edge = true_prob - effective_prob
+                adjusted_edge = raw_edge - cfg.safety_haircut
+                rejected_out_of_edge_range.append(
+                    _build_opportunity(
+                        matched=matched, agg=agg, side=side, token_id=token_id,
+                        true_prob=true_prob, book=book, fill_price=fill_price,
+                        filled=filled, raw_edge=raw_edge, adjusted_edge=adjusted_edge,
+                        target=target, gates=_gates,
+                    )
+                )
             continue
 
         # Effective cost includes any fee on top of the fill price
@@ -131,29 +160,29 @@ def detect_edge(
             fill_price, book, hours_until, cfg,
         )
 
-        # Early exit: skip sides outside the configured edge band.
-        # Optionally return these candidates for decision-log visibility.
+        # Rejected: outside the configured edge band or gates failed.
         if adjusted_edge < cfg.min_edge or adjusted_edge > cfg.max_edge:
             if include_rejected:
                 rejected_out_of_edge_range.append(
                     _build_opportunity(
-                        matched=matched,
-                        agg=agg,
-                        side=side,
-                        token_id=token_id,
-                        true_prob=true_prob,
-                        book=book,
-                        fill_price=fill_price,
-                        filled=filled,
-                        raw_edge=raw_edge,
-                        adjusted_edge=adjusted_edge,
-                        target=target,
-                        gates=gates,
+                        matched=matched, agg=agg, side=side, token_id=token_id,
+                        true_prob=true_prob, book=book, fill_price=fill_price,
+                        filled=filled, raw_edge=raw_edge, adjusted_edge=adjusted_edge,
+                        target=target, gates=gates,
                     )
                 )
             continue
 
         if not all(g["passed"] for g in gates.values()):
+            if include_rejected:
+                rejected_out_of_edge_range.append(
+                    _build_opportunity(
+                        matched=matched, agg=agg, side=side, token_id=token_id,
+                        true_prob=true_prob, book=book, fill_price=fill_price,
+                        filled=filled, raw_edge=raw_edge, adjusted_edge=adjusted_edge,
+                        target=target, gates=gates,
+                    )
+                )
             continue
 
         opp = _build_opportunity(

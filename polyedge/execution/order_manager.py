@@ -35,7 +35,7 @@ class OrderManager:
             )
             if ttl_expired or is_pre_event_window:
                 try:
-                    self.poly.cancel(oid)
+                    self.poly.orders.cancel(oid, {})
                     reason = "expired" if ttl_expired else "pre-event"
                     logger.info("Cancelled %s order %s", reason, oid)
                     del self.open_orders[oid]

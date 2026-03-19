@@ -83,6 +83,7 @@ class AllBookOdds:
     commence_time: str
     books: dict[str, tuple[SportsOutcome, SportsOutcome]] = field(default_factory=dict)
     spread_books: dict[str, tuple[SportsOutcome, SportsOutcome]] = field(default_factory=dict)
+    draw_odds: dict[str, float] = field(default_factory=dict)  # bookmaker → draw decimal odds
 
 @dataclass
 class PolyMarket:
@@ -96,6 +97,7 @@ class PolyMarket:
     sport_tag: str = ""
     question: str = ""
     start_iso: str = ""
+    market_slug: str = ""
 
 @dataclass
 class MatchedEvent:

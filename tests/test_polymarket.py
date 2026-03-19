@@ -2,7 +2,9 @@ import pytest
 from polyedge.models import BookLevel, OrderBook
 from polyedge.data.polymarket import (
     compute_avg_fill_price,
+    _classify_market_type,
     _extract_tradeable_markets,
+    _looks_like_spread,
     _parse_book_levels,
     _parse_outcomes_tokens,
     sport_to_tag_slug,
@@ -400,3 +402,30 @@ class TestSportSlugResolution:
 
     def test_table_tennis_prefix_maps_to_table_tennis_tag(self):
         assert sport_to_tag_slug("table_tennis_world_championship") == "table-tennis"
+
+
+class TestSpreadClassification:
+    def test_iso_date_in_question_not_classified_as_spread(self):
+        """Dates like 2026-03-06 should not trigger spread detection."""
+        assert not _looks_like_spread("Will CA Osasuna win on 2026-03-06?")
+        assert not _looks_like_spread("Who will win on 2026-12-25?")
+
+    def test_actual_spread_indicators_still_detected(self):
+        assert _looks_like_spread("Team A +1.5")
+        assert _looks_like_spread("Team B -3.5")
+        assert _looks_like_spread("Team A (+1.5)")
+        assert _looks_like_spread("spread")
+        assert _looks_like_spread("handicap")
+
+    def test_moneyline_with_date_classified_as_moneyline(self):
+        market = {
+            "question": "Will CA Osasuna win on 2026-03-06?",
+            "title": "CA Osasuna vs RCD Mallorca",
+        }
+        result = _classify_market_type(
+            market,
+            outcomes=["CA Osasuna", "RCD Mallorca"],
+            event_title="CA Osasuna vs RCD Mallorca",
+            sport_tag="soccer",
+        )
+        assert result == "moneyline"
