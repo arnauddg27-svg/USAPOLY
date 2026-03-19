@@ -872,7 +872,13 @@ class PolyEdgeBot:
                 m.poly_market.market_slug: m.poly_market.condition_id
                 for m in matches if m.poly_market.market_slug
             }
-            self._get_position_value()
+            pos_val = self._get_position_value()
+            if self._position_cost_by_condition:
+                logger.info(
+                    "Position tracking: total=%.2f, by_event=%s",
+                    pos_val,
+                    {k[:30]: round(v, 2) for k, v in self._position_cost_by_condition.items()},
+                )
 
         for matched in matches:
             cid = matched.poly_market.condition_id
