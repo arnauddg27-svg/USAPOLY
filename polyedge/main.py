@@ -270,6 +270,7 @@ class PolyEdgeBot:
         )
         self._last_positions_value = 0.0
         self._position_cost_by_condition: dict[str, float] = {}
+        self._slug_to_condition: dict[str, str] = {}
         self.breaker = CircuitBreaker()
         self.poly_client = None
         self.executor = None
@@ -554,30 +555,48 @@ class PolyEdgeBot:
         """Sum current market value of all open positions.
 
         Also builds ``_position_cost_by_condition`` — a map of
-        condition_id → cost basis (size × avgPrice) — used for
-        per-event exposure checks so we measure *actual* position
-        size rather than accumulated order submissions.
+        condition_id → cost basis — used for per-event exposure
+        checks so we measure *actual* position size rather than
+        accumulated order submissions.
+
+        Polymarket US returns positions as:
+        {"positions": {"aec-slug": {"netPosition": "14", "cost": {"value": "10.22"}, ...}}}
+        We key by condition_id when available, falling back to market slug.
         """
         if self.poly_client is None:
             return 0.0
         try:
-            positions = self.poly_client.portfolio.positions()
-            if not isinstance(positions, list):
-                positions = list(positions) if positions else []
+            raw = self.poly_client.portfolio.positions()
+            positions = raw.get("positions", {}) if isinstance(raw, dict) else {}
             total = 0.0
             by_condition: dict[str, float] = {}
-            for pos in positions:
-                if bool(pos.get("resolved")) or bool(pos.get("redeemable")):
-                    continue
-                size = _to_float(pos.get("size")) or 0.0
-                cur_price = _to_float(pos.get("curPrice")) or 0.0
-                total += size * cur_price
-                cid = str(pos.get("conditionId") or "").strip()
-                if cid and size > 0:
-                    avg_price = _to_float(pos.get("avgPrice")) or cur_price
-                    cost = size * avg_price
-                    by_condition[cid] = by_condition.get(cid, 0.0) + cost
+
+            if isinstance(positions, dict):
+                for slug, pos in positions.items():
+                    if not isinstance(pos, dict):
+                        continue
+                    if pos.get("expired"):
+                        continue
+                    net = _to_float(pos.get("netPosition")) or 0.0
+                    if net <= 0:
+                        continue
+                    cost_val = 0.0
+                    cost_obj = pos.get("cost")
+                    if isinstance(cost_obj, dict):
+                        cost_val = _to_float(cost_obj.get("value")) or 0.0
+                    cash_val = 0.0
+                    cash_obj = pos.get("cashValue")
+                    if isinstance(cash_obj, dict):
+                        cash_val = _to_float(cash_obj.get("value")) or 0.0
+                    total += cash_val if cash_val > 0 else cost_val
+
+                    # Map to condition_id for per-event cap checks.
+                    # Try to find matching condition_id from our market cache.
+                    cid = self._slug_to_condition.get(slug, slug)
+                    by_condition[cid] = by_condition.get(cid, 0.0) + cost_val
+
             self._position_cost_by_condition = by_condition
+            self._last_positions_value = total
             return total
         except Exception as e:
             logger.warning("Position value fetch failed: %s — using cash only", e)
@@ -846,6 +865,14 @@ class PolyEdgeBot:
                 return
         else:
             bankroll = DRY_RUN_BANKROLL_USD
+
+        # Refresh position data for exposure caps.
+        if self._is_live_mode():
+            self._slug_to_condition = {
+                m.poly_market.market_slug: m.poly_market.condition_id
+                for m in matches if m.poly_market.market_slug
+            }
+            self._get_position_value()
 
         for matched in matches:
             cid = matched.poly_market.condition_id
