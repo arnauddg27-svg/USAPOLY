@@ -1018,6 +1018,12 @@ class PolyEdgeBot:
                 # accumulating tracker, which over-counts across cycles.
                 # Check by condition_id first, then fall back to market slug
                 # to avoid the identity mismatch bug.
+                # Only bet on favorites (50c+ implied probability).
+                if opp.poly_fill_price < 0.50:
+                    cycle_stats.setdefault('skipped_underdog', 0)
+                    cycle_stats['skipped_underdog'] += 1
+                    continue
+
                 event_exposure = self._position_cost_by_condition.get(cid, 0.0)
                 if event_exposure == 0.0 and matched.poly_market.market_slug:
                     event_exposure = self._position_cost_by_slug.get(
