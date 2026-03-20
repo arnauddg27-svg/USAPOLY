@@ -582,8 +582,11 @@ class PolyEdgeBot:
                     if pos.get("expired"):
                         continue
                     net = _to_float(pos.get("netPosition")) or 0.0
-                    if net <= 0:
+                    if net == 0:
                         continue
+                    # Use absolute value: NO bets show as negative netPosition
+                    # (short positions) but still represent real exposure.
+                    net = abs(net)
                     cost_val = 0.0
                     cost_obj = pos.get("cost")
                     if isinstance(cost_obj, dict):
