@@ -270,6 +270,7 @@ class PolyEdgeBot:
         )
         self._last_positions_value = 0.0
         self._position_cost_by_condition: dict[str, float] = {}
+        self._position_cost_by_slug: dict[str, float] = {}
         self._slug_to_condition: dict[str, str] = {}
         self.breaker = CircuitBreaker()
         self.poly_client = None
@@ -554,14 +555,16 @@ class PolyEdgeBot:
     def _get_position_value(self) -> float:
         """Sum current market value of all open positions.
 
-        Also builds ``_position_cost_by_condition`` — a map of
-        condition_id → cost basis — used for per-event exposure
-        checks so we measure *actual* position size rather than
-        accumulated order submissions.
+        Builds two exposure maps for per-event cap checks:
+        - ``_position_cost_by_condition``: condition_id → cost basis
+        - ``_position_cost_by_slug``: market_slug → cost basis
+
+        Using both maps ensures exposure is detected even when the
+        slug-to-condition_id mapping fails (which caused the $400
+        Orlando Magic duplicate bet bug).
 
         Polymarket US returns positions as:
         {"positions": {"aec-slug": {"netPosition": "14", "cost": {"value": "10.22"}, ...}}}
-        We key by condition_id when available, falling back to market slug.
         """
         if self.poly_client is None:
             return 0.0
@@ -570,6 +573,7 @@ class PolyEdgeBot:
             positions = raw.get("positions", {}) if isinstance(raw, dict) else {}
             total = 0.0
             by_condition: dict[str, float] = {}
+            by_slug: dict[str, float] = {}
 
             if isinstance(positions, dict):
                 for slug, pos in positions.items():
@@ -590,12 +594,23 @@ class PolyEdgeBot:
                         cash_val = _to_float(cash_obj.get("value")) or 0.0
                     total += cash_val if cash_val > 0 else cost_val
 
-                    # Map to condition_id for per-event cap checks.
-                    # Try to find matching condition_id from our market cache.
-                    cid = self._slug_to_condition.get(slug, slug)
-                    by_condition[cid] = by_condition.get(cid, 0.0) + cost_val
+                    # Store by slug directly — always works.
+                    by_slug[slug] = by_slug.get(slug, 0.0) + cost_val
+
+                    # Also try to map slug → condition_id.
+                    cid = self._slug_to_condition.get(slug)
+                    if cid:
+                        by_condition[cid] = by_condition.get(cid, 0.0) + cost_val
+                    else:
+                        # Fallback: store under slug so we don't lose track entirely.
+                        logger.debug(
+                            "Position slug %s has no condition_id mapping — "
+                            "tracking by slug only (cost=%.2f)",
+                            slug, cost_val,
+                        )
 
             self._position_cost_by_condition = by_condition
+            self._position_cost_by_slug = by_slug
             self._last_positions_value = total
             return total
         except Exception as e:
@@ -873,12 +888,26 @@ class PolyEdgeBot:
                 for m in matches if m.poly_market.market_slug
             }
             pos_val = self._get_position_value()
-            if self._position_cost_by_condition:
+            if self._position_cost_by_condition or self._position_cost_by_slug:
                 logger.info(
-                    "Position tracking: total=%.2f, by_event=%s",
+                    "Position tracking: total=%.2f, by_cid=%s, by_slug=%s",
                     pos_val,
                     {k[:30]: round(v, 2) for k, v in self._position_cost_by_condition.items()},
+                    {k[:40]: round(v, 2) for k, v in self._position_cost_by_slug.items()},
                 )
+
+            # SAFETY BRAKE: If total exposure exceeds hard limit, stop all trading.
+            # This prevents runaway accumulation from any tracking bug.
+            max_total_hard_usd = bankroll * 0.30  # Never exceed 30% total exposure
+            if pos_val > max_total_hard_usd:
+                logger.error(
+                    "SAFETY BRAKE: total exposure $%.2f exceeds hard limit $%.2f "
+                    "(30%% of $%.2f bankroll) — blocking ALL trades this cycle",
+                    pos_val, max_total_hard_usd, bankroll,
+                )
+                cycle_stats["status"] = "blocked_safety_brake"
+                self.last_fast_cycle = cycle_stats
+                return
 
         for matched in matches:
             cid = matched.poly_market.condition_id
@@ -997,7 +1026,13 @@ class PolyEdgeBot:
                 )
                 # Use actual position cost from Polymarket instead of the
                 # accumulating tracker, which over-counts across cycles.
+                # Check by condition_id first, then fall back to market slug
+                # to avoid the identity mismatch bug.
                 event_exposure = self._position_cost_by_condition.get(cid, 0.0)
+                if event_exposure == 0.0 and matched.poly_market.market_slug:
+                    event_exposure = self._position_cost_by_slug.get(
+                        matched.poly_market.market_slug, 0.0
+                    )
                 opp.bet_usd = compute_bet_size(
                     adjusted_edge=opp.adjusted_edge,
                     fill_price=opp.poly_fill_price,
@@ -1027,6 +1062,12 @@ class PolyEdgeBot:
                 # Hard cap: actual position + new bet must not exceed per-event limit.
                 # Uses real Polymarket position data, not the accumulating tracker.
                 hard_cap = bankroll * self.cfg.max_per_event_pct
+                if event_exposure > 0:
+                    logger.debug(
+                        "Exposure check %s: exposure=%.2f, bet=%.2f, cap=%.2f, slug=%s",
+                        cid[:20], event_exposure, opp.bet_usd, hard_cap,
+                        matched.poly_market.market_slug,
+                    )
                 if event_exposure + opp.bet_usd > hard_cap:
                     cycle_stats["skipped_exposure"] += 1
                     audit_log.log_decision(
@@ -1084,6 +1125,18 @@ class PolyEdgeBot:
                         self.condition_side_lock[cid] = opp.buy_outcome
                         self.trades_today += 1
                         cycle_stats["submitted"] += 1
+                        # Immediately update in-cycle exposure so we don't
+                        # submit more orders for the same event this cycle.
+                        self._position_cost_by_condition[cid] = (
+                            self._position_cost_by_condition.get(cid, 0.0) + opp.bet_usd
+                        )
+                        if matched.poly_market.market_slug:
+                            self._position_cost_by_slug[matched.poly_market.market_slug] = (
+                                self._position_cost_by_slug.get(
+                                    matched.poly_market.market_slug, 0.0
+                                ) + opp.bet_usd
+                            )
+                        self._last_positions_value += opp.bet_usd
                         logger.info("ORDER SUBMITTED: %s %s edge=%.1f%% $%.2f @ %.4f",
                                     matched.poly_market.event_title,
                                     "YES" if opp.buy_outcome == "a" else "NO",
