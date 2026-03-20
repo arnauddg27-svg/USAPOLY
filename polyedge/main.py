@@ -896,19 +896,6 @@ class PolyEdgeBot:
                     {k[:40]: round(v, 2) for k, v in self._position_cost_by_slug.items()},
                 )
 
-            # SAFETY BRAKE: If total exposure exceeds hard limit, stop all trading.
-            # This prevents runaway accumulation from any tracking bug.
-            max_total_hard_usd = bankroll * 0.30  # Never exceed 30% total exposure
-            if pos_val > max_total_hard_usd:
-                logger.error(
-                    "SAFETY BRAKE: total exposure $%.2f exceeds hard limit $%.2f "
-                    "(30%% of $%.2f bankroll) — blocking ALL trades this cycle",
-                    pos_val, max_total_hard_usd, bankroll,
-                )
-                cycle_stats["status"] = "blocked_safety_brake"
-                self.last_fast_cycle = cycle_stats
-                return
-
         for matched in matches:
             cid = matched.poly_market.condition_id
             risk_event_id = _event_risk_id(matched)
