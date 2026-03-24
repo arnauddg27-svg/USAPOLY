@@ -58,8 +58,14 @@ class EdgeExecutor:
         market_slug = getattr(opp.matched_event.poly_market, "market_slug", "")
         if opp.buy_outcome == "a":
             intent = "ORDER_INTENT_BUY_LONG"
+            # Polymarket US: prices always refer to the YES/long side.
+            order_price = limit_price
         else:
             intent = "ORDER_INTENT_BUY_SHORT"
+            # Polymarket US: BUY_SHORT price must be the YES-side price.
+            # If we want to buy NO at limit_price, send 1 - limit_price.
+            order_price = round(1.0 - limit_price, 4)
+        order_price = max(0.01, min(0.99, order_price))
 
         tif = ("TIME_IN_FORCE_FILL_OR_KILL" if cfg.no_resting_orders
                else "TIME_IN_FORCE_GOOD_TILL_CANCEL")
@@ -69,7 +75,7 @@ class EdgeExecutor:
                 "marketSlug": market_slug,
                 "intent": intent,
                 "type": "ORDER_TYPE_LIMIT",
-                "price": {"value": str(limit_price), "currency": "USD"},
+                "price": {"value": str(order_price), "currency": "USD"},
                 "quantity": int(opp.shares),
                 "tif": tif,
             })
