@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import re
 
@@ -6,139 +8,60 @@ import aiohttp
 from polyedge.models import BookLevel, OrderBook, PolyMarket
 
 
-
-def _us_slug(gamma_slug: str) -> str:
-    """Prepend aec- prefix for Polymarket US market slugs."""
-    if not gamma_slug or gamma_slug.startswith("aec-") or gamma_slug.startswith("tec-"):
-        return gamma_slug
-    return "aec-" + gamma_slug
-
 logger = logging.getLogger(__name__)
 
-POLY_CLOB_BASE = "https://clob.polymarket.com"
-POLY_GAMMA_BASE = "https://gamma-api.polymarket.com"
+# ---------------------------------------------------------------------------
+# Polymarket US API
+# ---------------------------------------------------------------------------
+
+POLY_US_BASE = "https://gateway.polymarket.us"
 _HEADERS = {"User-Agent": "PolyEdge/1.0"}
 
-SPORT_TAG_SLUGS = {
+# Map Odds API sport keys → Polymarket US league slugs.
+# These slugs are used with GET /v2/leagues/{slug}/events.
+US_LEAGUE_SLUGS: dict[str, str] = {
     "basketball_nba": "nba",
-    "americanfootball_nfl": "nfl",
-    "baseball_mlb": "mlb",
     "icehockey_nhl": "nhl",
+    "baseball_mlb": "mlb",
+    "americanfootball_nfl": "nfl",
+    "basketball_ncaab": "cbb",
     "mma_mixed_martial_arts": "ufc",
+    "boxing_boxing": "boxing",
+    "soccer_epl": "epl",
+    "soccer_uefa_champs_league": "ucl",
+    "soccer_usa_mls": "mls",
+    "tennis_atp_miami_open": "atp",
+    "tennis_wta_miami_open": "wta",
 }
 
-# League-specific tag slugs for discovering individual game events.
-# The Gamma API events endpoint returns only futures/outrights for broad
-# sport tags (e.g. "soccer").  Individual match events (moneyline, spreads)
-# are indexed under league-specific tags like "premier-league".
-GAME_EVENT_TAG_SLUGS: dict[str, list[str]] = {
-    "soccer_epl": ["premier-league"],
-    "soccer_spain_la_liga": ["la-liga"],
-    "soccer_germany_bundesliga": ["bundesliga"],
-    "soccer_italy_serie_a": ["serie-a"],
-    "soccer_france_ligue_one": ["ligue-1"],
-    "soccer_uefa_champs_league": ["champions-league"],
-    "soccer_uefa_europa_league": ["europa-league"],
-    "soccer_mexico_ligamx": ["liga-mx"],
-    "soccer_usa_mls": ["mls"],
-    "soccer_brazil_serie_a": ["brasileirao"],
-    "soccer_fa_cup": ["fa-cup"],
-    "soccer_efl_champ": ["efl-championship"],
-    "soccer_portugal_primeira_liga": ["primeira-liga"],
-    "soccer_netherlands_eredivisie": ["eredivisie"],
-    "soccer_turkey_super_league": ["super-lig"],
-    "soccer_belgium_first_div": ["belgian-pro-league"],
-}
+# Some Odds API keys share a Polymarket US league (e.g. all ATP events → "atp").
+# This fallback catches keys not listed explicitly above.
+_SPORT_PREFIX_TO_LEAGUE: list[tuple[str, str]] = [
+    ("tennis_atp", "atp"),
+    ("tennis_wta", "wta"),
+]
 
 
-def sport_to_tag_slug(sport_key: str) -> str:
-    """Resolve an Odds API sport key to a Polymarket Gamma tag slug."""
+def _sport_to_us_league(sport_key: str) -> str:
+    """Resolve an Odds API sport key to a Polymarket US league slug."""
     key = str(sport_key or "").strip().lower()
     if not key:
         return ""
-    if key in SPORT_TAG_SLUGS:
-        return SPORT_TAG_SLUGS[key]
-    if key.startswith("soccer_"):
-        return "soccer"
-    if key.startswith("tennis_"):
-        return "tennis"
-    if key.startswith("cricket_"):
-        return "cricket"
-    if key in {"rugby", "rugby_all", "rugby_*"}:
-        return "rugby"
-    if key.startswith("rugby_") or key.startswith("rugbyunion_") or key.startswith("rugbyleague_"):
-        return "rugby"
-    if key.startswith("table_tennis_"):
-        return "table-tennis"
+    if key in US_LEAGUE_SLUGS:
+        return US_LEAGUE_SLUGS[key]
+    for prefix, league in _SPORT_PREFIX_TO_LEAGUE:
+        if key.startswith(prefix):
+            return league
     return ""
 
-_SPREAD_PATTERN = re.compile(r"(?<!\d)[+-]\s*\d+(?:\.\d+)?")
-_NUMERIC_PARENS_PATTERN = re.compile(r"\(\s*[+-]?\s*\d+(?:\.\d+)?\s*\)")
-_OVER_UNDER_RE = re.compile(r"\b(?:over|under)\b")
-_MONEYLINE_HINTS = (
-    "moneyline",
-    "match winner",
-    "to win",
-    "winner",
-)
-_SPREAD_HINTS = (
-    "spread",
-    "handicap",
-    "run line",
-    "puck line",
-)
-_TOTAL_HINTS = (
-    "total",
-    "o/u",
-    "over",
-    "under",
-)
-_NON_MATCH_PROP_HINTS = (
-    "set winner",
-    "total sets",
-    "set handicap",
-    "set spread",
-    "set total",
-    "period winner",
-    "total periods",
-    "halftime",
-    "half-time",
-    "first-half",
-    "second-half",
-    "regulation winner",
-    "in regulation",
-    "after 60",
-    "60-minute",
-    "60 minute",
-    "60 min",
-    "series winner",
-)
-_SEGMENT_MARKET_RE = re.compile(
-    r"\b(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth)\s+"
-    r"(?:set|period|quarter|half|inning|map|game)\b"
-)
-_SEGMENT_SHORT_RE = re.compile(
-    r"\b(?:1h|2h|h1|h2|"
-    r"1q|2q|3q|4q|q1|q2|q3|q4|"
-    r"1p|2p|3p|p1|p2|p3)\b"
-)
-_SET_N_WINNER_RE = re.compile(
-    r"\bset\s*(?:\d+|first|second|third|fourth|fifth)\s+winner\b"
-)
-_MATCHUP_HINT_RE = re.compile(r"\bvs\.?\b|\bv\b|@")
-_YES_NO_MONEYLINE_RE = re.compile(
-    r"\bwill\s+.+?\s+(?:win|beat|defeat)\b",
-    re.IGNORECASE,
-)
+
+# Backward-compatible alias used by the matcher for cross-sport filtering.
+sport_to_tag_slug = _sport_to_us_league
 
 
-def _first_non_empty(*values: object) -> str:
-    for value in values:
-        text = str(value or "").strip()
-        if text:
-            return text
-    return ""
-
+# ---------------------------------------------------------------------------
+# Utility kept from original code (used by edge_detector / sizing)
+# ---------------------------------------------------------------------------
 
 def compute_avg_fill_price(asks: list[BookLevel], target_shares: float) -> tuple[float, float]:
     """Walk the order book to compute volume-weighted avg fill price.
@@ -157,14 +80,23 @@ def compute_avg_fill_price(asks: list[BookLevel], target_shares: float) -> tuple
     return (total_cost / filled if filled > 0 else 0.0), filled
 
 
-def _parse_book_levels(rows: list[dict]) -> list[BookLevel]:
+# ---------------------------------------------------------------------------
+# Parse Polymarket US book levels
+# ---------------------------------------------------------------------------
+
+def _parse_us_book_levels(rows: list[dict]) -> list[BookLevel]:
+    """Parse Polymarket US order book entries.
+
+    US format: {"px": {"value": "0.680", "currency": "USD"}, "qty": "108633.000"}
+    """
     levels: list[BookLevel] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         try:
-            price = float(row.get("price"))
-            size = float(row.get("size"))
+            px = row.get("px", {})
+            price = float(px.get("value")) if isinstance(px, dict) else float(px)
+            size = float(row.get("qty", 0))
         except (TypeError, ValueError):
             continue
         if price <= 0 or size <= 0:
@@ -173,56 +105,29 @@ def _parse_book_levels(rows: list[dict]) -> list[BookLevel]:
     return levels
 
 
-def _parse_outcomes_tokens(market: dict) -> tuple[list, list] | None:
-    """Parse outcomes and tokens from a market dict, handling JSON strings."""
-    import json as _json
+# ---------------------------------------------------------------------------
+# Market type classification (kept for safety filtering)
+# ---------------------------------------------------------------------------
 
-    outcomes = market.get("outcomes", "")
-    if isinstance(outcomes, str):
-        try:
-            outcomes = _json.loads(outcomes)
-        except Exception:
-            return None
+_ALLOWED_SPORTS_MARKET_TYPES = {"moneyline", "spreads"}
 
-    tokens = market.get("clobTokenIds", "")
-    if isinstance(tokens, str):
-        try:
-            tokens = _json.loads(tokens)
-        except Exception:
-            return None
-
-    if not isinstance(outcomes, (list, tuple)) or not isinstance(tokens, (list, tuple)):
-        return None
-    if len(outcomes) != 2 or len(tokens) != 2:
-        return None
-    if any(not str(t).strip() for t in tokens):
-        return None
-    return outcomes, tokens
+_NON_MATCH_PROP_HINTS = (
+    "set winner", "total sets", "set handicap", "set spread", "set total",
+    "period winner", "total periods", "halftime", "half-time",
+    "first-half", "second-half", "regulation winner", "in regulation",
+    "after 60", "60-minute", "60 minute", "60 min", "series winner",
+)
+_SEGMENT_MARKET_RE = re.compile(
+    r"\b(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth)\s+"
+    r"(?:set|period|quarter|half|inning|map|game)\b"
+)
+_SEGMENT_SHORT_RE = re.compile(
+    r"\b(?:1h|2h|h1|h2|1q|2q|3q|4q|q1|q2|q3|q4|1p|2p|3p|p1|p2|p3)\b"
+)
 
 
-def _looks_like_total(text: str) -> bool:
-    t = str(text).strip().lower()
-    if not t:
-        return False
-    if " o/u" in t or "o/u " in t:
-        return True
-    if "total" in t:
-        return True
-    return _OVER_UNDER_RE.search(t) is not None
-
-
-def _looks_like_spread(text: str) -> bool:
-    t = str(text).strip().lower()
-    if not t:
-        return False
-    if _SPREAD_PATTERN.search(t):
-        return True
-    if _NUMERIC_PARENS_PATTERN.search(t):
-        return True
-    return any(kw in t for kw in _SPREAD_HINTS)
-
-
-def _looks_like_non_match_prop(text: str) -> bool:
+def _is_segment_or_prop(text: str) -> bool:
+    """Return True if text looks like a segment/prop market we should skip."""
     t = str(text).strip().lower()
     if not t:
         return False
@@ -230,200 +135,220 @@ def _looks_like_non_match_prop(text: str) -> bool:
         return True
     if _SEGMENT_SHORT_RE.search(t):
         return True
-    if _SET_N_WINNER_RE.search(t):
-        return True
     return any(kw in t for kw in _NON_MATCH_PROP_HINTS)
 
 
-def _classify_market_type(
-    market: dict,
-    outcomes: list[str],
-    event_title: str = "",
-    sport_tag: str = "",
-) -> str | None:
-    # Shortcut: game events carry an explicit sportsMarketType field.
-    smt = str(market.get("sportsMarketType") or "").strip().lower()
-    if smt:
-        if smt == "moneyline":
-            question = str(market.get("question") or "").strip().lower()
-            if "draw" in question or "tie" in question:
-                return None
-            return "moneyline"
-        if smt == "spreads":
-            return "spread"
-        # totals, both_teams_to_score, etc. — we don't trade these.
-        return None
+# ---------------------------------------------------------------------------
+# Extract tradeable markets from Polymarket US event data
+# ---------------------------------------------------------------------------
 
-    outcomes_lower = [str(o).strip().lower() for o in outcomes]
-    yes_no_market = set(outcomes_lower) == {"yes", "no"}
-    sport_tag_l = str(sport_tag or "").strip().lower()
-
-    question = str(market.get("question") or "").strip().lower()
-    market_title = str(market.get("title") or "").strip().lower()
-    event_title_l = str(event_title or "").strip().lower()
-    all_text = [question, market_title, event_title_l, *outcomes_lower]
-
-    # Guardrail: skip intra-match and prop markets (1st set/period, regulation, etc.).
-    if any(_looks_like_non_match_prop(text) for text in all_text):
-        return None
-    if any(_looks_like_total(text) for text in all_text):
-        return None
-    if yes_no_market:
-        # Some sports expose full-match outcomes as "Will Team X win/cover?"
-        # with Yes/No outcomes. Keep only clear matchup markets and still
-        # block draw/tie and segment props via guardrails above.
-        if "draw" in question or "tie" in question:
-            return None
-        has_matchup = any(_MATCHUP_HINT_RE.search(text) for text in (question, market_title, event_title_l) if text)
-        if not has_matchup:
-            return None
-        if any(_looks_like_spread(text) for text in (question, market_title, event_title_l) if text):
-            return "spread"
-        if sport_tag_l == "soccer" and _YES_NO_MONEYLINE_RE.search(question):
-            return "moneyline"
-        if sport_tag_l == "rugby" and "win" in question:
-            return "moneyline"
-        return None
-    if any(_looks_like_spread(text) for text in all_text):
-        return "spread"
-    if question and any(hint in question for hint in _MONEYLINE_HINTS):
-        return "moneyline"
-    if market_title and any(hint in market_title for hint in _MONEYLINE_HINTS):
-        return "moneyline"
-    # Fallback only when text looks like an explicit head-to-head matchup.
-    if any(_MATCHUP_HINT_RE.search(text) for text in (question, market_title, event_title_l) if text):
-        return "moneyline"
-    return None
-
-
-def _extract_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMarket]:
-    """Extract tradeable game markets (moneyline + spread) from a Gamma event."""
+def _extract_us_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMarket]:
+    """Extract tradeable game markets (moneyline + spread) from a Polymarket US event."""
     results = []
+    event_title = str(event.get("title") or "").strip()
+    event_start = str(event.get("startTime") or event.get("startDate") or "").strip()
+
     for market in event.get("markets", []):
-        if market.get("closed") or not market.get("active"):
+        if market.get("closed"):
             continue
 
-        parsed = _parse_outcomes_tokens(market)
-        if not parsed:
+        slug = str(market.get("slug") or "").strip()
+        if not slug:
             continue
-        outcomes, tokens = parsed
 
-        condition_id = str(market.get("conditionId", "")).strip()
-        if not condition_id:
+        # Classify using explicit sportsMarketType from US API.
+        smt = str(market.get("sportsMarketType") or "").strip().lower()
+        if smt not in _ALLOWED_SPORTS_MARKET_TYPES:
             continue
-        market_type = _classify_market_type(
-            market,
-            outcomes,
-            event_title=str(event.get("title") or ""),
-            sport_tag=sport_tag,
-        )
-        if market_type is None:
+
+        market_type = "moneyline" if smt == "moneyline" else "spread"
+
+        question = str(market.get("question") or "").strip()
+
+        # Safety: skip segment/prop markets that might slip through.
+        if _is_segment_or_prop(question) or _is_segment_or_prop(event_title):
             continue
+
+        # Skip draw/tie moneylines.
+        q_lower = question.lower()
+        if market_type == "moneyline" and ("draw" in q_lower or "tie" in q_lower):
+            continue
+
+        # Extract outcomes from marketSides.
+        sides = market.get("marketSides", [])
+        if len(sides) != 2:
+            continue
+
+        long_side = None
+        short_side = None
+        for side in sides:
+            if side.get("long") is True:
+                long_side = side
+            elif side.get("long") is False:
+                short_side = side
+
+        if not long_side or not short_side:
+            continue
+
+        # Use the market slug as the instrument identifier (Polymarket US convention).
+        identifier = slug
+
+        outcome_a = str(long_side.get("description") or "").strip()
+        outcome_b = str(short_side.get("description") or "").strip()
+
+        # For spread markets the descriptions are like "+1.50" / "-1.50",
+        # which aren't useful team names.  Fall back to question parsing.
+        if not outcome_a or not outcome_b:
+            continue
+
+        # Use market ID as condition_id (unique within Polymarket US).
+        condition_id = str(market.get("id") or slug).strip()
 
         results.append(
             PolyMarket(
-                event_title=event.get("title", ""),
+                event_title=event_title,
                 condition_id=condition_id,
-                outcome_a=str(outcomes[0]).strip(),
-                outcome_b=str(outcomes[1]).strip(),
-                token_id_a=str(tokens[0]).strip(),
-                token_id_b=str(tokens[1]).strip(),
+                outcome_a=outcome_a,
+                outcome_b=outcome_b,
+                token_id_a=identifier,   # Long-side identifier
+                token_id_b=identifier,   # Same slug; side determined by intent
                 market_type=market_type,
                 sport_tag=sport_tag,
-                question=str(market.get("question") or ""),
-                start_iso=_first_non_empty(
-                    market.get("gameStartTime"),
-                    market.get("eventStartTime"),
-                    market.get("startTime"),
-                    market.get("eventStartDate"),
-                    market.get("endDate"),
-                    market.get("start"),
-                    market.get("startDate"),
-                    event.get("gameStartTime"),
-                    event.get("eventStartTime"),
-                    event.get("startTime"),
-                    event.get("eventStartDate"),
-                    event.get("endDate"),
-                    event.get("start"),
-                    event.get("startDate"),
-                ),
-                market_slug=_us_slug(str(market.get("slug") or event.get("slug") or "").strip()),
+                question=question,
+                start_iso=str(market.get("gameStartTime") or event_start),
+                market_slug=slug,
             )
         )
     return results
 
-async def fetch_sports_markets(sports: list[str]) -> list[PolyMarket]:
-    """Fetch game markets (moneyline + spread) from Polymarket Gamma API.
 
-    For each sport we query:
-      1. The broad sport-level tag (e.g. ``soccer``, ``nba``) — catches
-         standard event-style markets.
-      2. League-specific game-event tags (e.g. ``premier-league``) — catches
-         individual match events with moneyline / spread lines that the Gamma
-         API does **not** surface under the broad sport tag.
+# ---------------------------------------------------------------------------
+# Fetch sports markets from Polymarket US
+# ---------------------------------------------------------------------------
+
+async def fetch_sports_markets(sports: list[str]) -> list[PolyMarket]:
+    """Fetch game markets (moneyline + spread) from Polymarket US API.
+
+    Queries ``/v2/leagues/{league}/events`` for each sport, extracting
+    tradeable moneyline and spread markets with correct US slugs.
     """
-    seen_slugs: set[str] = set()
-    # Each entry is (tag_slug_to_query, sport_tag_for_matching).
-    slug_entries: list[tuple[str, str]] = []
+    seen_leagues: set[str] = set()
+    league_entries: list[tuple[str, str]] = []   # (us_league_slug, odds_api_sport_key)
     for s in sports:
-        sport_slug = sport_to_tag_slug(s)
-        if sport_slug and sport_slug not in seen_slugs:
-            slug_entries.append((sport_slug, sport_slug))
-            seen_slugs.add(sport_slug)
-        # League-specific tags for game event discovery.
-        for league_slug in GAME_EVENT_TAG_SLUGS.get(s.strip().lower(), []):
-            if league_slug not in seen_slugs:
-                slug_entries.append((league_slug, sport_slug or league_slug))
-                seen_slugs.add(league_slug)
+        league = _sport_to_us_league(s)
+        if league and league not in seen_leagues:
+            league_entries.append((league, s))
+            seen_leagues.add(league)
+
     markets: list[PolyMarket] = []
-    seen_conditions: set[str] = set()
-    async with aiohttp.ClientSession(headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as session:
-        for query_slug, sport_tag in slug_entries:
+    seen_slugs: set[str] = set()
+
+    async with aiohttp.ClientSession(headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as session:
+        for league_slug, sport_key in league_entries:
+            url = f"{POLY_US_BASE}/v2/leagues/{league_slug}/events"
             offset = 0
-            while offset < 1000:
-                params = {"tag_slug": query_slug, "active": "true", "closed": "false",
-                          "limit": 50, "offset": offset}
+            while offset < 500:
+                params: dict = {"type": "sport", "limit": 50, "offset": offset}
                 try:
-                    async with session.get(f"{POLY_GAMMA_BASE}/events", params=params) as resp:
+                    async with session.get(url, params=params) as resp:
                         if resp.status != 200:
-                            logger.warning("Gamma API returned %d for slug=%s", resp.status, query_slug)
+                            logger.warning("Polymarket US returned %d for league=%s", resp.status, league_slug)
                             break
-                        events = await resp.json()
-                        if not isinstance(events, list):
-                            logger.warning("Gamma API returned non-list payload for slug=%s", query_slug)
-                            break
+                        data = await resp.json()
+                        events = data.get("events", [])
                         if not events:
                             break
                         for ev in events:
-                            for pm in _extract_tradeable_markets(ev, sport_tag=sport_tag):
-                                if pm.condition_id in seen_conditions:
+                            for pm in _extract_us_tradeable_markets(ev, sport_tag=league_slug):
+                                if pm.market_slug in seen_slugs:
                                     continue
-                                seen_conditions.add(pm.condition_id)
+                                seen_slugs.add(pm.market_slug)
                                 markets.append(pm)
                         offset += 50
                 except Exception as e:
-                    logger.warning("Gamma API fetch failed for slug=%s: %s", query_slug, e)
+                    logger.warning("Polymarket US fetch failed for league=%s: %s", league_slug, e)
                     break
-            slug_type_counts = {}
+
+            slug_type_counts: dict[str, int] = {}
             for pm in markets:
-                if pm.sport_tag == sport_tag:
+                if pm.sport_tag == league_slug:
                     slug_type_counts[pm.market_type] = slug_type_counts.get(pm.market_type, 0) + 1
             if slug_type_counts:
-                logger.info("Gamma slug=%s: %s", query_slug, slug_type_counts)
+                logger.info("US league=%s: %s", league_slug, slug_type_counts)
+
     return markets
 
-async def fetch_order_book(token_id: str) -> OrderBook:
-    """Fetch order book from Polymarket CLOB API."""
+
+# ---------------------------------------------------------------------------
+# Fetch order book from Polymarket US
+# ---------------------------------------------------------------------------
+
+async def fetch_order_book(market_slug: str) -> OrderBook:
+    """Fetch the LONG-side order book from Polymarket US.
+
+    Returns an OrderBook where:
+      - asks = prices you can BUY LONG at (ascending)
+      - bids = prices you can SELL LONG at (descending)
+
+    The ``token_id`` field is set to the market slug for tracking.
+    """
     async with aiohttp.ClientSession(headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as session:
-        url = f"{POLY_CLOB_BASE}/book"
-        async with session.get(url, params={"token_id": token_id}) as resp:
+        url = f"{POLY_US_BASE}/v1/markets/{market_slug}/book"
+        async with session.get(url) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"CLOB book API returned {resp.status} for {token_id}")
+                raise RuntimeError(f"US book API returned {resp.status} for {market_slug}")
             data = await resp.json()
-            if not isinstance(data, dict):
-                raise RuntimeError(f"CLOB book API returned non-object payload for {token_id}")
-            asks = _parse_book_levels(data.get("asks", []))
-            bids = _parse_book_levels(data.get("bids", []))
+            md = data.get("marketData", data)
+            if not isinstance(md, dict):
+                raise RuntimeError(f"US book API returned non-object for {market_slug}")
+
+            # US API: offers = sell-long (you can buy long from these)
+            #         bids   = buy-long  (you can sell long to these)
+            asks = _parse_us_book_levels(md.get("offers", []))
+            bids = _parse_us_book_levels(md.get("bids", []))
             asks.sort(key=lambda x: x.price)
             bids.sort(key=lambda x: -x.price)
-            return OrderBook(token_id=token_id, outcome_name="", asks=asks, bids=bids)
+            return OrderBook(token_id=market_slug, outcome_name="", asks=asks, bids=bids)
+
+
+async def fetch_order_book_pair(market_slug: str) -> tuple[OrderBook, OrderBook]:
+    """Fetch both long-side and short-side order books from a single US market.
+
+    Returns (book_a, book_b) where:
+      - book_a = long-side book (buy/sell the "Yes" / team-A outcome)
+      - book_b = short-side book (buy/sell the "No" / team-B outcome),
+                 derived by flipping prices: short_price = 1 - long_price
+    """
+    async with aiohttp.ClientSession(headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as session:
+        url = f"{POLY_US_BASE}/v1/markets/{market_slug}/book"
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"US book API returned {resp.status} for {market_slug}")
+            data = await resp.json()
+            md = data.get("marketData", data)
+            if not isinstance(md, dict):
+                raise RuntimeError(f"US book API returned non-object for {market_slug}")
+
+            # Parse raw levels from US API.
+            raw_offers = _parse_us_book_levels(md.get("offers", []))  # sell-long prices
+            raw_bids = _parse_us_book_levels(md.get("bids", []))      # buy-long prices
+
+            # Book A (long side): buy long from offers, sell long to bids.
+            asks_a = sorted(raw_offers, key=lambda x: x.price)
+            bids_a = sorted(raw_bids, key=lambda x: -x.price)
+            book_a = OrderBook(token_id=market_slug, outcome_name="long", asks=asks_a, bids=bids_a)
+
+            # Book B (short side): derived by flipping.
+            # Buy short = other side of sell long → flip bids.
+            # Sell short = other side of buy long → flip offers.
+            asks_b = sorted(
+                [BookLevel(price=round(1.0 - b.price, 4), size=b.size) for b in raw_bids],
+                key=lambda x: x.price,
+            )
+            bids_b = sorted(
+                [BookLevel(price=round(1.0 - o.price, 4), size=o.size) for o in raw_offers],
+                key=lambda x: -x.price,
+            )
+            book_b = OrderBook(token_id=market_slug, outcome_name="short", asks=asks_b, bids=bids_b)
+
+            return book_a, book_b

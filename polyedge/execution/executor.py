@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 import logging
 from polyedge.models import EdgeOpportunity, OpenOrder
@@ -51,11 +53,10 @@ class EdgeExecutor:
             )
             return None
 
-        # Determine order intent based on which outcome we're buying
+        # Determine order intent based on which outcome we're buying.
+        # outcome "a" = long side, outcome "b" = short side.
         market_slug = getattr(opp.matched_event.poly_market, "market_slug", "")
-        # outcome_a is typically "Yes"/Long, outcome_b is "No"/Short
-        # If we're buying token_id_a, we want BUY_LONG; token_id_b means BUY_SHORT
-        if opp.buy_token_id == opp.matched_event.poly_market.token_id_a:
+        if opp.buy_outcome == "a":
             intent = "ORDER_INTENT_BUY_LONG"
         else:
             intent = "ORDER_INTENT_BUY_SHORT"

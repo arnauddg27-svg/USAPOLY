@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -7,7 +9,7 @@ import re
 from dotenv import load_dotenv
 from polyedge.config import EdgeConfig
 from polyedge.data.odds_api import fetch_all_odds
-from polyedge.data.polymarket import fetch_sports_markets, fetch_order_book
+from polyedge.data.polymarket import fetch_sports_markets, fetch_order_book_pair
 from polyedge.data.cache import TTLCache
 from polyedge.pipeline.devig import devig, devig_three_way
 from polyedge.pipeline.aggregator import aggregate_probs
@@ -269,6 +271,8 @@ class PolyEdgeBot:
             state_path=EXPOSURE_STATE_PATH if not self.cfg.simulation_mode else None
         )
         self._last_positions_value = 0.0
+        self._open_positions_count = 0
+        self._open_positions_value = 0.0
         self._position_cost_by_condition: dict[str, float] = {}
         self._position_cost_by_slug: dict[str, float] = {}
         self._slug_to_condition: dict[str, str] = {}
@@ -279,6 +283,7 @@ class PolyEdgeBot:
         self.cycle = 0
         self.trades_today = 0
         self.started_at = datetime.now(timezone.utc)
+        self.live_wallet_address: str | None = None
         self.live_wallet_balance_usd = None
         self.live_wallet_start_usd = None
         start_bankroll = (
@@ -415,6 +420,16 @@ class PolyEdgeBot:
                     if self.live_wallet_balance_usd is not None
                     else None
                 )
+                payload["wallet_address"] = (
+                    str(self.live_wallet_address).strip()
+                    if self.live_wallet_address
+                    else None
+                )
+                payload["open_positions_count"] = int(self._open_positions_count)
+                payload["open_positions_value_usd"] = round(
+                    float(self._open_positions_value),
+                    2,
+                )
                 payload["wallet_start_usd"] = (
                     round(float(self.live_wallet_start_usd), 2)
                     if self.live_wallet_start_usd is not None
@@ -425,6 +440,11 @@ class PolyEdgeBot:
                     if self.live_wallet_balance_usd is not None and self.live_wallet_start_usd is not None
                     else None
                 )
+                if self.live_wallet_balance_usd is not None:
+                    payload["total_equity_usd"] = round(
+                        float(self.live_wallet_balance_usd) + float(self._open_positions_value),
+                        2,
+                    )
             HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = HEALTH_PATH.with_suffix(".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -432,6 +452,29 @@ class PolyEdgeBot:
             tmp_path.replace(HEALTH_PATH)
         except Exception as e:
             logger.warning("Failed to write health status: %s", e)
+
+    def _extract_wallet_address(self) -> str | None:
+        """Best-effort extraction of the trading wallet address from the client."""
+        if self.poly_client is None:
+            return None
+
+        for key in ("address", "wallet_address", "trading_address", "account_address"):
+            value = getattr(self.poly_client, key, None)
+            text = str(value or "").strip()
+            if text.startswith("0x"):
+                return text
+
+        for attr_name in ("account", "portfolio"):
+            obj = getattr(self.poly_client, attr_name, None)
+            if obj is None:
+                continue
+            for key in ("address", "wallet_address", "trading_address", "account_address"):
+                value = getattr(obj, key, None)
+                text = str(value or "").strip()
+                if text.startswith("0x"):
+                    return text
+
+        return None
 
     @staticmethod
     def _cashout_limit_price(cur_price: float, tick: float, min_limit: float) -> float:
@@ -572,6 +615,7 @@ class PolyEdgeBot:
             raw = self.poly_client.portfolio.positions()
             positions = raw.get("positions", {}) if isinstance(raw, dict) else {}
             total = 0.0
+            open_count = 0
             by_condition: dict[str, float] = {}
             by_slug: dict[str, float] = {}
 
@@ -595,7 +639,9 @@ class PolyEdgeBot:
                     cash_obj = pos.get("cashValue")
                     if isinstance(cash_obj, dict):
                         cash_val = _to_float(cash_obj.get("value")) or 0.0
-                    total += cash_val if cash_val > 0 else cost_val
+                    position_value = cash_val if cash_val > 0 else cost_val
+                    total += position_value
+                    open_count += 1
 
                     # Store by slug directly — always works.
                     by_slug[slug] = by_slug.get(slug, 0.0) + cost_val
@@ -614,10 +660,14 @@ class PolyEdgeBot:
 
             self._position_cost_by_condition = by_condition
             self._position_cost_by_slug = by_slug
+            self._open_positions_count = open_count
+            self._open_positions_value = total
             self._last_positions_value = total
             return total
         except Exception as e:
             logger.warning("Position value fetch failed: %s — using cash only", e)
+            self._open_positions_count = 0
+            self._open_positions_value = 0.0
             return 0.0
 
     def _get_bankroll(self) -> float | None:
@@ -873,6 +923,8 @@ class PolyEdgeBot:
                 self.last_fast_cycle = cycle_stats
                 return
             self.live_wallet_balance_usd = float(bankroll)
+            if not self.live_wallet_address:
+                self.live_wallet_address = self._extract_wallet_address()
             if self.live_wallet_start_usd is None:
                 self.live_wallet_start_usd = float(bankroll)
             if bankroll <= 0:
@@ -913,8 +965,7 @@ class PolyEdgeBot:
                 continue
 
             try:
-                book_a = await fetch_order_book(matched.poly_market.token_id_a)
-                book_b = await fetch_order_book(matched.poly_market.token_id_b)
+                book_a, book_b = await fetch_order_book_pair(matched.poly_market.market_slug)
             except Exception as e:
                 cycle_stats["skipped_order_book_fetch"] += 1
                 logger.warning("Order book fetch failed for %s: %s", cid, e)
