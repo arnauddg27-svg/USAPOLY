@@ -276,6 +276,11 @@ class PolyEdgeBot:
         self._position_cost_by_condition: dict[str, float] = {}
         self._position_cost_by_slug: dict[str, float] = {}
         self._slug_to_condition: dict[str, str] = {}
+        # Tracks submitted order cost that the API may not reflect yet.
+        # Keyed by condition_id → cumulative USD submitted.
+        # Cleared per-key once the API position catches up.
+        self._submitted_cost_by_cid: dict[str, float] = {}
+        self._submitted_cost_by_slug: dict[str, float] = {}
         self.breaker = CircuitBreaker()
         self.poly_client = None
         self.executor = None
@@ -657,6 +662,23 @@ class PolyEdgeBot:
                             "tracking by slug only (cost=%.2f)",
                             slug, cost_val,
                         )
+
+            # Merge with submitted-but-not-yet-visible costs.
+            # Once the API reflects a position >= what we submitted,
+            # clear the submitted floor for that key.
+            for cid_key, sub_val in list(self._submitted_cost_by_cid.items()):
+                api_val = by_condition.get(cid_key, 0.0)
+                if api_val >= sub_val:
+                    del self._submitted_cost_by_cid[cid_key]
+                else:
+                    by_condition[cid_key] = sub_val
+                    total += sub_val - api_val
+            for slug_key, sub_val in list(self._submitted_cost_by_slug.items()):
+                api_val = by_slug.get(slug_key, 0.0)
+                if api_val >= sub_val:
+                    del self._submitted_cost_by_slug[slug_key]
+                else:
+                    by_slug[slug_key] = sub_val
 
             self._position_cost_by_condition = by_condition
             self._position_cost_by_slug = by_slug
@@ -1174,6 +1196,16 @@ class PolyEdgeBot:
                         if matched.poly_market.market_slug:
                             self._position_cost_by_slug[matched.poly_market.market_slug] = (
                                 self._position_cost_by_slug.get(
+                                    matched.poly_market.market_slug, 0.0
+                                ) + opp.bet_usd
+                            )
+                        # Persist submitted cost so it survives the next API sync.
+                        self._submitted_cost_by_cid[cid] = (
+                            self._submitted_cost_by_cid.get(cid, 0.0) + opp.bet_usd
+                        )
+                        if matched.poly_market.market_slug:
+                            self._submitted_cost_by_slug[matched.poly_market.market_slug] = (
+                                self._submitted_cost_by_slug.get(
                                     matched.poly_market.market_slug, 0.0
                                 ) + opp.bet_usd
                             )
