@@ -159,10 +159,9 @@ def detect_edge(
                 )
             continue
 
-        # Effective cost includes any fee on top of the fill price
-        effective_prob = fill_price + cfg.fee_rate
-        raw_edge = true_prob - effective_prob
-        adjusted_edge = raw_edge - cfg.safety_haircut
+        # Raw edge: true probability minus fill price, no fee/haircut reduction.
+        raw_edge = true_prob - fill_price
+        adjusted_edge = raw_edge
         gates = check_gates(
             adjusted_edge, agg.books_used, filled,
             fill_price, book, hours_until, cfg,
