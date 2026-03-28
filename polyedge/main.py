@@ -812,7 +812,7 @@ class PolyEdgeBot:
                     _sport = str(m.sport)
                     has_draw = _sport.startswith("soccer_") or _sport.startswith("rugby_") or _sport.startswith("rugbyunion_") or _sport.startswith("rugbyleague_")
                     draw_decimal = m.all_odds.draw_odds.get(bk_name) if has_draw else None
-                    if has_draw and market_type == "moneyline":
+                    if has_draw and market_type in ("moneyline", "drawable"):
                         if not draw_decimal:
                             # Skip books without draw odds for soccer/rugby moneyline —
                             # 2-way devig inflates win probs by absorbing draw probability.

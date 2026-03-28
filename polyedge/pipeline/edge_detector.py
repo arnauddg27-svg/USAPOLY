@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from polyedge.models import (
     MatchedEvent, AggregatedProb, OrderBook, EdgeOpportunity,
     ConfidenceTier, EdgeSource,
@@ -107,6 +109,10 @@ def detect_edge(
         market_type in ("moneyline", "spread")
         and cfg.moneyline_favorites_only
     )
+    # Drawable markets: only trade side "a" (BUY_LONG = Yes = team wins).
+    # Side "b" (No = team doesn't win) absorbs draw probability and should
+    # not be traded.
+    drawable_long_only = market_type == "drawable"
     favorite_side = "a" if agg.prob_a >= agg.prob_b else "b"
 
     for side, true_prob, book, token_id in [
@@ -114,6 +120,8 @@ def detect_edge(
         ("b", agg.prob_b, book_b, matched.poly_market.token_id_b),
     ]:
         if favorites_only and side != favorite_side:
+            continue
+        if drawable_long_only and side != "a":
             continue
 
         fill_price, filled = compute_avg_fill_price(book.asks, target)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -721,6 +723,8 @@ def match_events(
             market_bonus = 0.0
             if market_type == "moneyline":
                 market_bonus += _MONEYLINE_SCORE_BONUS
+            elif market_type == "drawable":
+                market_bonus += _MONEYLINE_SCORE_BONUS  # same priority as moneyline
             elif market_type == "spread":
                 market_bonus += (
                     _SPREAD_SCORE_WITH_BOOKS_BONUS

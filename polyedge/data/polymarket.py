@@ -110,6 +110,7 @@ def _parse_us_book_levels(rows: list[dict]) -> list[BookLevel]:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_SPORTS_MARKET_TYPES = {"moneyline", "spreads"}
+_DRAWABLE_SPORTS_MARKET_TYPE = "drawable_outcome"
 
 _NON_MATCH_PROP_HINTS = (
     "set winner", "total sets", "set handicap", "set spread", "set total",
@@ -159,6 +160,99 @@ def _looks_like_spread_number(text: str) -> bool:
 # ---------------------------------------------------------------------------
 # Extract tradeable markets from Polymarket US event data
 # ---------------------------------------------------------------------------
+
+def _extract_drawable_markets(event: dict, sport_tag: str = "", min_favorite_price: float = 0.50) -> list[PolyMarket]:
+    """Extract tradeable drawable_outcome markets from a Polymarket US event.
+
+    Soccer events have three-way markets (Team A / Draw / Team B) as separate
+    binary Yes/No markets.  For the *favorite* team (bestBid >= min_favorite_price),
+    we create a PolyMarket entry so the edge detector can compare the team's
+    win probability against the Polymarket Yes price.
+    """
+    results = []
+    event_title = str(event.get("title") or "").strip()
+    event_start = str(event.get("startTime") or event.get("startDate") or "").strip()
+
+    # Build teamId → team name lookup from event participants.
+    team_names: dict[int, str] = {}
+    for p in event.get("participants", []):
+        team = p.get("team") or {}
+        tid = team.get("id")
+        name = str(team.get("name") or team.get("safeName") or "").strip()
+        if tid and name:
+            team_names[tid] = name
+
+    # Collect non-draw team-win markets with their team identity.
+    team_markets: list[tuple[dict, str]] = []  # (market_dict, team_name)
+    for market in event.get("markets", []):
+        smt = str(market.get("sportsMarketType") or "").strip().lower()
+        if smt != _DRAWABLE_SPORTS_MARKET_TYPE:
+            continue
+        if market.get("closed"):
+            continue
+        question = str(market.get("question") or "").strip().lower()
+        if "draw" in question:
+            continue
+        # Identify which team this market belongs to via marketSides teamId.
+        sides = market.get("marketSides", [])
+        team_id = None
+        for s in sides:
+            tid = s.get("teamId")
+            if tid:
+                team_id = tid
+                break
+        if team_id is None or team_id not in team_names:
+            continue
+        team_markets.append((market, team_names[team_id]))
+
+    if len(team_markets) != 2:
+        return results
+
+    # Determine the favorite: use bestBid as the current price proxy.
+    best_prices = []
+    for mkt, _ in team_markets:
+        best_bid = 0.0
+        try:
+            best_bid = float(mkt.get("bestBid", 0))
+        except (TypeError, ValueError):
+            pass
+        best_prices.append(best_bid)
+
+    fav_idx = 0 if best_prices[0] >= best_prices[1] else 1
+    if best_prices[fav_idx] < min_favorite_price:
+        return results
+
+    fav_market, fav_name = team_markets[fav_idx]
+    _, other_name = team_markets[1 - fav_idx]
+
+    slug = str(fav_market.get("slug") or "").strip()
+    if not slug:
+        return results
+
+    # Safety: skip segment/prop markets.
+    question = str(fav_market.get("question") or "").strip()
+    if _is_segment_or_prop(question) or _is_segment_or_prop(event_title):
+        return results
+
+    condition_id = str(fav_market.get("id") or slug).strip()
+
+    results.append(
+        PolyMarket(
+            event_title=event_title,
+            condition_id=condition_id,
+            outcome_a=fav_name,
+            outcome_b=other_name,
+            token_id_a=slug,
+            token_id_b=slug,
+            market_type="drawable",
+            sport_tag=sport_tag,
+            question=question,
+            start_iso=str(fav_market.get("gameStartTime") or event_start),
+            market_slug=slug,
+        )
+    )
+    return results
+
 
 def _extract_us_tradeable_markets(event: dict, sport_tag: str = "") -> list[PolyMarket]:
     """Extract tradeable game markets (moneyline + spread) from a Polymarket US event."""
@@ -264,6 +358,9 @@ def _extract_us_tradeable_markets(event: dict, sport_tag: str = "") -> list[Poly
                 market_slug=slug,
             )
         )
+
+    # Also extract drawable_outcome markets (soccer three-way).
+    results.extend(_extract_drawable_markets(event, sport_tag=sport_tag))
     return results
 
 
