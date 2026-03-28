@@ -138,6 +138,24 @@ def _is_segment_or_prop(text: str) -> bool:
     return any(kw in t for kw in _NON_MATCH_PROP_HINTS)
 
 
+_VS_RE = re.compile(r"\s+(?:vs\.?|v\.?|@)\s+", re.IGNORECASE)
+_SPREAD_NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def _split_vs_title(title: str) -> tuple[str, str] | None:
+    """Split 'Team A vs. Team B' into (team_a, team_b)."""
+    parts = _VS_RE.split(str(title or "").strip(), maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        # Strip trailing date fragments like "2026-03-28"
+        b = re.sub(r"\s+\d{4}-\d{2}-\d{2}.*$", "", parts[1].strip())
+        return parts[0].strip(), b.strip() if b.strip() else parts[1].strip()
+    return None
+
+
+def _looks_like_spread_number(text: str) -> bool:
+    return bool(_SPREAD_NUM_RE.match(str(text or "").strip()))
+
+
 # ---------------------------------------------------------------------------
 # Extract tradeable markets from Polymarket US event data
 # ---------------------------------------------------------------------------
@@ -147,6 +165,20 @@ def _extract_us_tradeable_markets(event: dict, sport_tag: str = "") -> list[Poly
     results = []
     event_title = str(event.get("title") or "").strip()
     event_start = str(event.get("startTime") or event.get("startDate") or "").strip()
+
+    # Pre-scan: grab team names from the moneyline market so spread markets
+    # can reuse them (moneyline sides have proper names like "Spurs" / "Bucks").
+    _ml_long_name = ""
+    _ml_short_name = ""
+    for m in event.get("markets", []):
+        if str(m.get("sportsMarketType") or "").strip().lower() == "moneyline":
+            for side in m.get("marketSides", []):
+                desc = str(side.get("description") or "").strip()
+                if side.get("long") is True:
+                    _ml_long_name = desc
+                elif side.get("long") is False:
+                    _ml_short_name = desc
+            break
 
     for market in event.get("markets", []):
         if market.get("closed"):
@@ -196,10 +228,23 @@ def _extract_us_tradeable_markets(event: dict, sport_tag: str = "") -> list[Poly
         outcome_a = str(long_side.get("description") or "").strip()
         outcome_b = str(short_side.get("description") or "").strip()
 
-        # For spread markets the descriptions are like "+1.50" / "-1.50",
-        # which aren't useful team names.  Fall back to question parsing.
         if not outcome_a or not outcome_b:
             continue
+
+        # For spread markets the side descriptions are numeric ("+1.50" / "-1.50").
+        # The matcher needs team names to match against odds data.  Prefer the
+        # moneyline market's team names (e.g. "Spurs" / "Bucks") which the
+        # matcher already handles well; fall back to event title city names.
+        if market_type == "spread" and _looks_like_spread_number(outcome_a):
+            if _ml_long_name and _ml_short_name:
+                outcome_a = _ml_long_name
+                outcome_b = _ml_short_name
+            else:
+                teams = _split_vs_title(event_title)
+                if not teams:
+                    continue
+                outcome_a = teams[0]
+                outcome_b = teams[1]
 
         # Use market ID as condition_id (unique within Polymarket US).
         condition_id = str(market.get("id") or slug).strip()
