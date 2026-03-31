@@ -137,10 +137,6 @@ def detect_edge(
                     )
                 )
             continue
-        # In strict favorites-only mode, only allow buying the market-favorite side
-        # at favorite pricing (>= 0.50).
-        if favorites_only and fill_price < 0.50:
-            continue
         # Raw edge: true probability minus fill price, no fee/haircut reduction.
         raw_edge = true_prob - fill_price
         adjusted_edge = raw_edge
