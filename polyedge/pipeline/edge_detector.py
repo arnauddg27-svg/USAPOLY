@@ -141,24 +141,6 @@ def detect_edge(
         # at favorite pricing (>= 0.50).
         if favorites_only and fill_price < 0.50:
             continue
-        # Cap filter: never buy at or above configured max entry price.
-        hard_buy_cap = float(getattr(cfg, "max_fill_price", 0.91))
-        if fill_price >= hard_buy_cap:
-            if include_rejected:
-                _gates = {"fill_price_cap": {"passed": False, "value": fill_price, "threshold": hard_buy_cap}}
-                effective_prob = fill_price + cfg.fee_rate
-                raw_edge = true_prob - effective_prob
-                adjusted_edge = raw_edge - cfg.safety_haircut
-                rejected_out_of_edge_range.append(
-                    _build_opportunity(
-                        matched=matched, agg=agg, side=side, token_id=token_id,
-                        true_prob=true_prob, book=book, fill_price=fill_price,
-                        filled=filled, raw_edge=raw_edge, adjusted_edge=adjusted_edge,
-                        target=target, gates=_gates,
-                    )
-                )
-            continue
-
         # Raw edge: true probability minus fill price, no fee/haircut reduction.
         raw_edge = true_prob - fill_price
         adjusted_edge = raw_edge

@@ -43,16 +43,6 @@ class EdgeExecutor:
             limit_price = round(opp.poly_mid - cfg.order_offset, 4)
         limit_price = max(0.01, min(0.99, limit_price))
 
-        configured_cap = float(getattr(cfg, "max_fill_price", 0.91))
-        max_buy_price = max(0.01, min(0.99, configured_cap))
-        if limit_price >= max_buy_price:
-            self.last_error = f"buy_price_cap:{limit_price:.4f}>={max_buy_price:.4f}"
-            logger.info(
-                "Skipping order for %s due to buy cap (limit=%.4f cap=%.4f)",
-                opp.buy_token_id, limit_price, max_buy_price,
-            )
-            return None
-
         # Determine order intent based on which outcome we're buying.
         # outcome "a" = long side, outcome "b" = short side.
         market_slug = getattr(opp.matched_event.poly_market, "market_slug", "")
