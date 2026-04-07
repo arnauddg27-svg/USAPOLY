@@ -6,18 +6,13 @@ def _kelly_bet_pct(
 ) -> float:
     if fill_price <= 0 or fill_price >= 1:
         return 0.0
-    edge = max(adjusted_edge, 0.0)
-    if edge <= 0:
+    if adjusted_edge <= 0:
         return 0.0
+    # Use a fixed 1% edge for Kelly sizing regardless of actual edge.
+    fixed_edge = 0.01
     decimal_odds = 1.0 / fill_price
-    kelly_raw = edge / (decimal_odds - 1) if decimal_odds > 1 else 0.0
-    kelly_adj = kelly_raw * fraction_kelly
-
-    # Stronger edges size up modestly vs. threshold edges.
-    edge_span = max(0.20 - min_edge, 1e-6)
-    edge_pos = max(0.0, min(1.0, (edge - min_edge) / edge_span))
-    edge_multiplier = 1.0 + 0.5 * edge_pos
-    return max(0.0, kelly_adj * edge_multiplier)
+    kelly_raw = fixed_edge / (decimal_odds - 1) if decimal_odds > 1 else 0.0
+    return max(0.0, kelly_raw * fraction_kelly)
 
 
 def compute_event_cap_pct(
