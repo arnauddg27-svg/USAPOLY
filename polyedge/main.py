@@ -983,9 +983,25 @@ class PolyEdgeBot:
                     {k[:40]: round(v, 2) for k, v in self._position_cost_by_slug.items()},
                 )
 
-        for matched in matches:
+        # Prioritise moneyline over spread: sort so moneyline markets come first,
+        # then skip spread/drawable if the same underlying game already has a
+        # moneyline match.
+        _MTYPE_ORDER = {"moneyline": 0, "drawable": 1, "spread": 2}
+        sorted_matches = sorted(
+            matches,
+            key=lambda m: _MTYPE_ORDER.get(getattr(m.poly_market, "market_type", "moneyline"), 9),
+        )
+        _seen_game_keys: set[str] = set()
+
+        for matched in sorted_matches:
             cid = matched.poly_market.condition_id
             risk_event_id = _event_risk_id(matched)
+            # Build a game-level key (without market_type) to deduplicate.
+            _game_key = risk_event_id.replace("|spread|", "|*|").replace("|moneyline|", "|*|").replace("|drawable|", "|*|")
+            mtype = getattr(matched.poly_market, "market_type", "moneyline")
+            if mtype != "moneyline" and _game_key in _seen_game_keys:
+                continue
+            _seen_game_keys.add(_game_key)
             agg = agg_cache.get(cid)
             if not agg:
                 cycle_stats["skipped_no_agg"] += 1
