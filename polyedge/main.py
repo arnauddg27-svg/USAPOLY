@@ -781,12 +781,16 @@ class PolyEdgeBot:
         odds_games_by_sport = Counter(g.sport for g in all_odds)
         matches_by_sport = Counter(m.sport for m in matches)
 
-        # Only count US-regulated sportsbooks toward the min_books threshold.
-        _US_BOOKS = {
+        # US-regulated books + top-tier European sharp books for consensus.
+        _ALLOWED_BOOKS = {
+            # US
             "betmgm", "draftkings", "fanduel", "fanatics", "betrivers",
             "williamhill_us", "bovada", "betonlineag", "betus",
             "mybookieag", "lowvig", "pointsbetus", "superbook",
             "espnbet", "hard_rock",
+            # European sharp books
+            "pinnacle", "betfair", "matchbook", "smarkets",
+            "bet365", "unibet", "betway",
         }
 
         def _build_aggregates(min_books: int, soccer_min_books: int):
@@ -802,7 +806,7 @@ class PolyEdgeBot:
                     else m.all_odds.books
                 )
                 for bk_name, (out_a, out_b) in source_books.items():
-                    if bk_name.lower() not in _US_BOOKS:
+                    if bk_name.lower() not in _ALLOWED_BOOKS:
                         continue
                     oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
                     if oriented is None:
