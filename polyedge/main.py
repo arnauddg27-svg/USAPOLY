@@ -781,18 +781,6 @@ class PolyEdgeBot:
         odds_games_by_sport = Counter(g.sport for g in all_odds)
         matches_by_sport = Counter(m.sport for m in matches)
 
-        # US-regulated books + top-tier European sharp books for consensus.
-        _ALLOWED_BOOKS = {
-            # US
-            "betmgm", "draftkings", "fanduel", "fanatics", "betrivers",
-            "williamhill_us", "bovada", "betonlineag", "betus",
-            "mybookieag", "lowvig", "pointsbetus", "superbook",
-            "espnbet", "hardrockbet",
-            # European sharp books
-            "pinnacle", "betfair", "matchbook", "smarkets",
-            "bet365", "unibet", "betway",
-        }
-
         # Soccer-specific whitelist: sharp line-setters + tier-1 market makers.
         # Excludes noisy offshore/recreational books that add noise for soccer.
         _SOCCER_ALLOWED_BOOKS = {
@@ -822,9 +810,8 @@ class PolyEdgeBot:
                 )
                 _sp = str(m.sport)
                 is_soccer = _sp.startswith("soccer_")
-                allowed = _SOCCER_ALLOWED_BOOKS if is_soccer else _ALLOWED_BOOKS
                 for bk_name, (out_a, out_b) in source_books.items():
-                    if bk_name.lower() not in allowed:
+                    if is_soccer and bk_name.lower() not in _SOCCER_ALLOWED_BOOKS:
                         continue
                     oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
                     if oriented is None:
