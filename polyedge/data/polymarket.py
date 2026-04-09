@@ -27,15 +27,19 @@ US_LEAGUE_SLUGS: dict[str, str] = {
     "basketball_ncaab": "cbb",
     "mma_mixed_martial_arts": "ufc",
     "boxing_boxing": "boxing",
+    # Soccer
     "soccer_epl": "epl",
     "soccer_uefa_champs_league": "ucl",
     "soccer_usa_mls": "mls",
+    "soccer_germany_bundesliga": "bun",
+    "soccer_spain_la_liga": "lal",
+    "soccer_italy_serie_a": "sea",
+    # Tennis (specific tournaments map to same league)
     "tennis_atp_miami_open": "atp",
     "tennis_wta_miami_open": "wta",
 }
 
-# Some Odds API keys share a Polymarket US league (e.g. all ATP events → "atp").
-# This fallback catches keys not listed explicitly above.
+# Fallback prefix matching for keys not listed explicitly above.
 _SPORT_PREFIX_TO_LEAGUE: list[tuple[str, str]] = [
     ("tennis_atp", "atp"),
     ("tennis_wta", "wta"),
@@ -161,13 +165,12 @@ def _looks_like_spread_number(text: str) -> bool:
 # Extract tradeable markets from Polymarket US event data
 # ---------------------------------------------------------------------------
 
-def _extract_drawable_markets(event: dict, sport_tag: str = "", min_favorite_price: float = 0.50) -> list[PolyMarket]:
+def _extract_drawable_markets(event: dict, sport_tag: str = "") -> list[PolyMarket]:
     """Extract tradeable drawable_outcome markets from a Polymarket US event.
 
     Soccer events have three-way markets (Team A / Draw / Team B) as separate
-    binary Yes/No markets.  For the *favorite* team (bestBid >= min_favorite_price),
-    we create a PolyMarket entry so the edge detector can compare the team's
-    win probability against the Polymarket Yes price.
+    binary Yes/No markets.  We create a PolyMarket entry for EACH team so the
+    edge detector can evaluate both sides independently.
     """
     results = []
     event_title = str(event.get("title") or "").strip()
@@ -208,45 +211,33 @@ def _extract_drawable_markets(event: dict, sport_tag: str = "", min_favorite_pri
     if len(team_markets) != 2:
         return results
 
-    # Determine the favorite: use bestBid as the current price proxy.
-    best_prices = []
-    for mkt, _ in team_markets:
-        best_bid = 0.0
-        try:
-            best_bid = float(mkt.get("bestBid", 0))
-        except (TypeError, ValueError):
-            pass
-        best_prices.append(best_bid)
+    # Create a PolyMarket entry for each team's win market.
+    for i in range(2):
+        mkt, team_name = team_markets[i]
+        _, other_name = team_markets[1 - i]
 
-    fav_idx = 0 if best_prices[0] >= best_prices[1] else 1
-    if best_prices[fav_idx] < min_favorite_price:
-        return results
+        slug = str(mkt.get("slug") or "").strip()
+        if not slug:
+            continue
 
-    fav_market, fav_name = team_markets[fav_idx]
-    _, other_name = team_markets[1 - fav_idx]
+        # Safety: skip segment/prop markets.
+        question = str(mkt.get("question") or "").strip()
+        if _is_segment_or_prop(question) or _is_segment_or_prop(event_title):
+            continue
 
-    slug = str(fav_market.get("slug") or "").strip()
-    if not slug:
-        return results
+        condition_id = str(mkt.get("id") or slug).strip()
 
-    # Safety: skip segment/prop markets.
-    question = str(fav_market.get("question") or "").strip()
-    if _is_segment_or_prop(question) or _is_segment_or_prop(event_title):
-        return results
-
-    condition_id = str(fav_market.get("id") or slug).strip()
-
-    results.append(
-        PolyMarket(
-            event_title=event_title,
-            condition_id=condition_id,
-            outcome_a=fav_name,
-            outcome_b=other_name,
-            token_id_a=slug,
-            token_id_b=slug,
-            market_type="drawable",
-            sport_tag=sport_tag,
-            question=question,
+        results.append(
+            PolyMarket(
+                event_title=event_title,
+                condition_id=condition_id,
+                outcome_a=team_name,
+                outcome_b=other_name,
+                token_id_a=slug,
+                token_id_b=slug,
+                market_type="drawable",
+                sport_tag=sport_tag,
+                question=question,
             start_iso=str(fav_market.get("gameStartTime") or event_start),
             market_slug=slug,
         )
