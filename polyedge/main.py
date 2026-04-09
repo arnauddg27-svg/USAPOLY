@@ -787,8 +787,7 @@ class PolyEdgeBot:
             "betmgm", "draftkings", "fanduel", "fanatics", "betrivers",
             "williamhill_us", "bovada", "betonlineag", "betus",
             "mybookieag", "lowvig", "pointsbetus", "superbook",
-            "espnbet", "hardrockbet", "ballybet", "betparx",
-            "rebet", "thescore", "betanything",
+            "espnbet", "hardrockbet",
             # European sharp books
             "pinnacle", "betfair", "matchbook", "smarkets",
             "bet365", "unibet", "betway",
