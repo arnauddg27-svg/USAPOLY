@@ -793,6 +793,21 @@ class PolyEdgeBot:
             "bet365", "unibet", "betway",
         }
 
+        # Soccer-specific whitelist: sharp line-setters + tier-1 market makers.
+        # Excludes noisy offshore/recreational books that add noise for soccer.
+        _SOCCER_ALLOWED_BOOKS = {
+            # Sharp (line-setters)
+            "pinnacle", "betfair_ex_uk", "betfair_ex_eu", "betfair_ex_au",
+            "betfair_sb_uk", "matchbook", "smarkets",
+            # Tier-1 market makers
+            "draftkings", "fanduel", "betmgm", "williamhill_us",
+            "unibet", "unibet_uk", "unibet_fr", "unibet_nl", "unibet_se",
+            "betway", "paddypower", "coral", "ladbrokes_uk",
+            "skybet", "boylesports", "betvictor",
+            # Solid EU
+            "betsson", "winamax_fr", "winamax_de",
+        }
+
         def _build_aggregates(min_books: int, soccer_min_books: int):
             cache = {}
             by_sport = Counter()
@@ -805,8 +820,11 @@ class PolyEdgeBot:
                     if market_type == "spread"
                     else m.all_odds.books
                 )
+                _sp = str(m.sport)
+                is_soccer = _sp.startswith("soccer_")
+                allowed = _SOCCER_ALLOWED_BOOKS if is_soccer else _ALLOWED_BOOKS
                 for bk_name, (out_a, out_b) in source_books.items():
-                    if bk_name.lower() not in _ALLOWED_BOOKS:
+                    if bk_name.lower() not in allowed:
                         continue
                     oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
                     if oriented is None:
