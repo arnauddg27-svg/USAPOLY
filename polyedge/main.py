@@ -781,19 +781,36 @@ class PolyEdgeBot:
         odds_games_by_sport = Counter(g.sport for g in all_odds)
         matches_by_sport = Counter(m.sport for m in matches)
 
-        # Soccer-specific whitelist: sharp line-setters + tier-1 market makers.
-        # Excludes noisy offshore/recreational books that add noise for soccer.
+        # Soccer whitelist: sharp + tier-1, excludes noisy offshore books.
         _SOCCER_ALLOWED_BOOKS = {
-            # Sharp (line-setters)
+            # Sharp / exchanges
             "pinnacle", "betfair_ex_uk", "betfair_ex_eu", "betfair_ex_au",
             "betfair_sb_uk", "matchbook", "smarkets",
-            # Tier-1 market makers
+            # Tier-1 US
             "draftkings", "fanduel", "betmgm", "williamhill_us",
-            "unibet", "unibet_uk", "unibet_fr", "unibet_nl", "unibet_se",
+            # Major UK/EU
+            "williamhill", "bet365", "unibet", "unibet_uk",
             "betway", "paddypower", "coral", "ladbrokes_uk",
             "skybet", "boylesports", "betvictor",
-            # Solid EU
-            "betsson", "winamax_fr", "winamax_de",
+            # Solid mid-tier
+            "sport888", "betrivers",
+        }
+
+        # US sports whitelist: sharp + tier-1 US + solid exchanges.
+        # Excludes offshore/recreational (Bovada, BetUS, BetOnline, LowVig,
+        # MyBookie, BetAnything, ReBet, betPARX, Bally Bet, Fliff, Betr,
+        # theScore, GTbets, Everygame).
+        _US_SPORT_ALLOWED_BOOKS = {
+            # Sharp
+            "pinnacle",
+            # Tier-1 US
+            "draftkings", "fanduel", "betmgm", "williamhill_us",
+            "fanatics", "betrivers", "hardrockbet",
+            # Exchanges
+            "betfair_ex_uk", "betfair_ex_eu", "betfair_ex_au",
+            "betfair_sb_uk", "matchbook", "smarkets",
+            # Major / solid
+            "williamhill", "sport888", "betvictor", "betway",
         }
 
         def _build_aggregates(min_books: int, soccer_min_books: int):
@@ -810,8 +827,9 @@ class PolyEdgeBot:
                 )
                 _sp = str(m.sport)
                 is_soccer = _sp.startswith("soccer_")
+                allowed = _SOCCER_ALLOWED_BOOKS if is_soccer else _US_SPORT_ALLOWED_BOOKS
                 for bk_name, (out_a, out_b) in source_books.items():
-                    if is_soccer and bk_name.lower() not in _SOCCER_ALLOWED_BOOKS:
+                    if bk_name.lower() not in allowed:
                         continue
                     oriented = orient_book_outcomes(m.team_a, m.team_b, out_a, out_b)
                     if oriented is None:
