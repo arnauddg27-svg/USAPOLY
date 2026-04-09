@@ -105,22 +105,15 @@ def detect_edge(
     rejected_out_of_edge_range = []
     target = cfg.target_shares
     market_type = getattr(matched.poly_market, "market_type", "moneyline")
-    favorites_only = (
-        market_type in ("moneyline", "spread")
-        and cfg.moneyline_favorites_only
-    )
     # Drawable markets: only trade side "a" (BUY_LONG = Yes = team wins).
     # Side "b" (No = team doesn't win) absorbs draw probability and should
     # not be traded.
     drawable_long_only = market_type == "drawable"
-    favorite_side = "a" if agg.prob_a >= agg.prob_b else "b"
 
     for side, true_prob, book, token_id in [
         ("a", agg.prob_a, book_a, matched.poly_market.token_id_a),
         ("b", agg.prob_b, book_b, matched.poly_market.token_id_b),
     ]:
-        if favorites_only and side != favorite_side:
-            continue
         if drawable_long_only and side != "a":
             continue
 
@@ -137,9 +130,8 @@ def detect_edge(
                     )
                 )
             continue
-        # In strict favorites-only mode, only allow buying the market-favorite side
-        # at favorite pricing (>= 0.50).
-        if favorites_only and fill_price < 0.50:
+        # Minimum price floor: don't buy below 20¢.
+        if fill_price < 0.20:
             continue
         # Cap filter: never buy at or above configured max entry price.
         hard_buy_cap = float(getattr(cfg, "max_fill_price", 0.91))
