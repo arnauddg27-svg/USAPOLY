@@ -130,8 +130,8 @@ def detect_edge(
                     )
                 )
             continue
-        # Minimum price floor: don't buy below 20¢.
-        if fill_price < 0.20:
+        # Minimum price floor: don't buy below 40¢.
+        if fill_price < 0.40:
             continue
         # Cap filter: never buy at or above configured max entry price.
         hard_buy_cap = float(getattr(cfg, "max_fill_price", 0.91))
